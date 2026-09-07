@@ -1,0 +1,2103 @@
+From 02b16b52560a9716d990dc058fe31b6c54522fbd Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?A=CC=82nderson=20Q?= <anquadros@gmail.com>
+Date: Sat, 6 Jun 2026 19:40:50 -0300
+Subject: [PATCH 1/3] Add per-window theme overrides
+
+Allow each window to use its own theme, chosen by the user and stored user-side keyed by workspace, without changing the app-wide `theme` setting or writing any project file. Windows without an override render the configured theme as before.
+
+- gpui: add `App::observe_window_draw` hook (runs at the start of each window's draw) and `App::update_global_quietly` for per-frame global updates that must not notify observers.
+
+- theme: add `WindowThemeOverrides` registry keyed by `WindowId`; split `GlobalTheme` into the per-frame active theme and the configured fallback; swap the active theme per window in a draw hook; drop a window's override when it closes.
+
+- theme_selector: add `theme: project` and `theme: clear project` actions that scope theme selection to the current project's window.
+
+- workspace: persist overrides in a new `window_theme_overrides` table and restore them on launch.
+---
+ crates/gpui/src/app.rs                      |  44 +++++++
+ crates/gpui/src/window.rs                   |   9 ++
+ crates/theme/src/theme.rs                   |  62 +++++++++-
+ crates/theme/src/window_theme.rs            |  91 +++++++++++++++
+ crates/theme_selector/src/theme_selector.rs | 123 +++++++++++++++-----
+ crates/theme_settings/src/theme_settings.rs |  47 +++++++-
+ crates/workspace/src/persistence.rs         |  31 +++++
+ crates/workspace/src/workspace.rs           |  33 ++++++
+ crates/zed_actions/src/lib.rs               |  14 ++-
+ 9 files changed, 415 insertions(+), 39 deletions(-)
+ create mode 100644 crates/theme/src/window_theme.rs
+
+diff --git a/crates/gpui/src/app.rs b/crates/gpui/src/app.rs
+index 3631499f..eadba91a 100644
+--- a/crates/gpui/src/app.rs
++++ b/crates/gpui/src/app.rs
+@@ -261,6 +261,7 @@ pub(crate) type KeystrokeObserver =
+     Box<dyn FnMut(&KeystrokeEvent, &mut Window, &mut App) -> bool + 'static>;
+ type QuitHandler = Box<dyn FnOnce(&mut App) -> LocalBoxFuture<'static, ()> + 'static>;
+ type WindowClosedHandler = Box<dyn FnMut(&mut App, WindowId)>;
++type WindowDrawObserver = Box<dyn FnMut(&mut Window, &mut App) + 'static>;
+ type ReleaseListener = Box<dyn FnOnce(&mut dyn Any, &mut App) + 'static>;
+ type NewEntityListener = Box<dyn FnMut(AnyEntity, &mut Option<&mut Window>, &mut App) + 'static>;
+ 
+@@ -644,6 +645,7 @@ pub struct App {
+     pub(crate) quit_observers: SubscriberSet<(), QuitHandler>,
+     pub(crate) restart_observers: SubscriberSet<(), Handler>,
+     pub(crate) window_closed_observers: SubscriberSet<(), WindowClosedHandler>,
++    pub(crate) window_draw_observers: SubscriberSet<(), WindowDrawObserver>,
+ 
+     /// Per-App element arena. This isolates element allocations between different
+     /// App instances (important for tests where multiple Apps run concurrently).
+@@ -767,6 +769,7 @@ impl App {
+                 restart_observers: SubscriberSet::new(),
+                 restart_path: None,
+                 window_closed_observers: SubscriberSet::new(),
++                window_draw_observers: SubscriberSet::new(),
+                 layout_id_buffer: Default::default(),
+                 propagate_event: true,
+                 prompt_builder: Some(PromptBuilder::Default),
+@@ -2156,6 +2159,47 @@ impl App {
+         subscription
+     }
+ 
++    /// Register a callback to be invoked at the start of every window's draw,
++    /// before its element tree is rendered. The callback receives the window
++    /// being drawn and the app context, so it can prepare per-window state that
++    /// the render pass will read (for example, swapping the active theme).
++    ///
++    /// The callback runs on every frame of every window, so it must be cheap and
++    /// must not schedule work that would invalidate the window it just prepared
++    /// (which would cause an unbounded redraw loop). See
++    /// [`App::update_global_quietly`] for mutating globals without notifying
++    /// observers from within such a callback.
++    pub fn observe_window_draw(
++        &self,
++        on_draw: impl FnMut(&mut Window, &mut App) + 'static,
++    ) -> Subscription {
++        let (subscription, activate) = self.window_draw_observers.insert((), Box::new(on_draw));
++        activate();
++        subscription
++    }
++
++    /// Updates the global of the given type in place without notifying its
++    /// observers.
++    ///
++    /// This is intended for high-frequency, transient updates — such as
++    /// per-frame state set from an [`App::observe_window_draw`] callback — where
++    /// the observer notification scheduled by [`update_global`] would cause a
++    /// redundant re-render every frame (and, for state read during draw, an
++    /// unbounded redraw loop). Observers will NOT be informed of the change.
++    ///
++    /// [`update_global`]: crate::BorrowAppContext::update_global
++    #[track_caller]
++    pub fn update_global_quietly<G: Global, R>(
++        &mut self,
++        f: impl FnOnce(&mut G, &mut Self) -> R,
++    ) -> R {
++        let mut lease = self.lease_global::<G>();
++        let result = f(&mut lease, self);
++        self.globals_by_type
++            .insert(TypeId::of::<G>(), lease.global);
++        result
++    }
++
+     pub(crate) fn clear_pending_keystrokes(&mut self) {
+         for window in self.windows() {
+             window
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+index c3a84c0b..a7fb5e02 100644
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -2602,6 +2602,15 @@ impl Window {
+                 self.rendered_frame.input_handlers.push(Some(input_handler));
+             }
+         }
++        // Let observers prepare per-window state (e.g. the active theme) before
++        // the element tree is rendered. Runs every frame, so observers must be
++        // cheap and must not notify in a way that re-invalidates this window.
++        let draw_observers = cx.window_draw_observers.clone();
++        draw_observers.retain(&(), |observer| {
++            observer(self, cx);
++            true
++        });
++
+         if !cx.mode.skip_drawing() {
+             self.draw_roots(cx);
+         }
+diff --git a/crates/theme/src/theme.rs b/crates/theme/src/theme.rs
+index cf4203dc..dfcd3796 100644
+--- a/crates/theme/src/theme.rs
++++ b/crates/theme/src/theme.rs
+@@ -19,6 +19,7 @@ mod schema;
+ mod styles;
+ mod theme_settings_provider;
+ mod ui_density;
++mod window_theme;
+ 
+ use std::sync::Arc;
+ 
+@@ -40,6 +41,7 @@ pub use crate::schema::*;
+ pub use crate::styles::*;
+ pub use crate::theme_settings_provider::*;
+ pub use crate::ui_density::*;
++pub use crate::window_theme::*;
+ 
+ /// The name of the default dark theme.
+ pub const DEFAULT_DARK_THEME: &str = "One Dark";
+@@ -112,7 +114,25 @@ pub fn init(themes_to_load: LoadThemes, cx: &mut App) {
+             .unwrap()
+     });
+     let icon_theme = themes.default_icon_theme().unwrap();
+-    cx.set_global(GlobalTheme { theme, icon_theme });
++    cx.set_global(GlobalTheme::new(theme, icon_theme));
++
++    // Per-window theming: a registry of user-chosen, per-window theme overrides
++    // and a draw hook that swaps the active theme into place at the start of each
++    // window's render pass. Windows without an override render the configured
++    // theme.
++    cx.set_global(WindowThemeOverrides::default());
++    cx.observe_window_draw(|window, cx| {
++        let window_id = window.window_handle().window_id();
++        WindowThemeOverrides::apply_for_window(cx, window_id);
++    })
++    .detach();
++    // Drop a closed window's override so the in-memory map doesn't grow for the
++    // lifetime of the session. The persisted override (keyed by workspace) is
++    // untouched and still restores on reopen.
++    cx.on_window_closed(|cx, window_id| {
++        WindowThemeOverrides::clear(cx, window_id);
++    })
++    .detach();
+ }
+ 
+ /// Implementing this trait allows accessing the active theme.
+@@ -291,20 +311,44 @@ pub fn deserialize_icon_theme(bytes: &[u8]) -> anyhow::Result<IconThemeFamilyCon
+ 
+ /// The active theme.
+ pub struct GlobalTheme {
++    /// The theme used for the render pass currently in progress. The per-window
++    /// theming hook swaps this at the start of each window's draw via
++    /// [`GlobalTheme::set_active_theme`]; for windows without an override it
++    /// equals `configured_theme`.
+     theme: Arc<Theme>,
++    /// The app-wide theme configured via settings. Used as the fallback for
++    /// windows that have no per-window override, and never swapped per frame.
++    configured_theme: Arc<Theme>,
+     icon_theme: Arc<IconTheme>,
+ }
+ impl Global for GlobalTheme {}
+ 
+ impl GlobalTheme {
+-    /// Creates a new [`GlobalTheme`] with the given theme and icon theme.
++    /// Creates a new [`GlobalTheme`] with the given theme and icon theme. The
++    /// given theme becomes both the active and the configured theme.
+     pub fn new(theme: Arc<Theme>, icon_theme: Arc<IconTheme>) -> Self {
+-        Self { theme, icon_theme }
++        Self {
++            configured_theme: theme.clone(),
++            theme,
++            icon_theme,
++        }
+     }
+ 
+-    /// Updates the active theme.
++    /// Updates the app-wide configured theme (and the active theme) and notifies
++    /// observers. Called when the theme settings change.
+     pub fn update_theme(cx: &mut App, theme: Arc<Theme>) {
+-        cx.update_global::<Self, _>(|this, _| this.theme = theme);
++        cx.update_global::<Self, _>(|this, _| {
++            this.configured_theme = theme.clone();
++            this.theme = theme;
++        });
++    }
++
++    /// Sets the theme for the render pass currently in progress *without*
++    /// notifying observers. Used by the per-window theming draw hook every frame;
++    /// notifying here would re-invalidate the window and cause an unbounded
++    /// redraw loop. See [`gpui::App::update_global_quietly`].
++    pub fn set_active_theme(cx: &mut App, theme: Arc<Theme>) {
++        cx.update_global_quietly::<Self, _>(|this, _| this.theme = theme);
+     }
+ 
+     /// Updates the active icon theme.
+@@ -312,11 +356,17 @@ impl GlobalTheme {
+         cx.update_global::<Self, _>(|this, _| this.icon_theme = icon_theme);
+     }
+ 
+-    /// Returns the active theme.
++    /// Returns the active theme (the theme for the window currently drawing).
+     pub fn theme(cx: &App) -> &Arc<Theme> {
+         &cx.global::<Self>().theme
+     }
+ 
++    /// Returns the app-wide configured theme — the fallback used for windows
++    /// without a per-window override.
++    pub fn configured_theme(cx: &App) -> &Arc<Theme> {
++        &cx.global::<Self>().configured_theme
++    }
++
+     /// Returns the active icon theme.
+     pub fn icon_theme(cx: &App) -> &Arc<IconTheme> {
+         &cx.global::<Self>().icon_theme
+diff --git a/crates/theme/src/window_theme.rs b/crates/theme/src/window_theme.rs
+new file mode 100644
+index 00000000..71b9b549
+--- /dev/null
++++ b/crates/theme/src/window_theme.rs
+@@ -0,0 +1,91 @@
++use std::collections::HashMap;
++use std::sync::Arc;
++
++use gpui::{App, BorrowAppContext, Global, SharedString, WindowId};
++
++use crate::{GlobalTheme, Theme};
++
++/// A single per-window theme override: the chosen theme's name (kept for
++/// persistence and re-resolution) plus its resolved value (ready to apply during
++/// the window's render pass).
++#[derive(Clone)]
++struct WindowThemeOverride {
++    theme_name: SharedString,
++    theme: Arc<Theme>,
++}
++
++/// Per-window theme overrides, keyed by window.
++///
++/// A window present in this map renders with its override theme instead of the
++/// app-wide configured theme. Overrides are stored user-side (never written to a
++/// project's `.zed/settings.json`) so that the user — not an opened repository —
++/// decides per-window appearance.
++///
++/// Resolving a theme name to an [`Arc<Theme>`] (and applying the user's theme
++/// overrides) requires the `theme_settings` crate, so callers resolve first and
++/// store via [`WindowThemeOverrides::set_resolved`]. The per-frame draw hook only
++/// reads the already-resolved theme, keeping it cheap.
++#[derive(Default)]
++pub struct WindowThemeOverrides {
++    overrides: HashMap<WindowId, WindowThemeOverride>,
++}
++
++impl Global for WindowThemeOverrides {}
++
++impl WindowThemeOverrides {
++    /// Stores a resolved theme override for a window. Does not trigger a redraw;
++    /// callers that want the change reflected immediately should call
++    /// [`App::refresh_windows`].
++    pub fn set_resolved(
++        cx: &mut App,
++        window_id: WindowId,
++        theme_name: SharedString,
++        theme: Arc<Theme>,
++    ) {
++        cx.update_global::<Self, _>(|this, _| {
++            this.overrides
++                .insert(window_id, WindowThemeOverride { theme_name, theme });
++        });
++    }
++
++    /// Removes the override for a window, falling back to the configured theme.
++    /// Returns whether an override was present. Does not trigger a redraw.
++    pub fn clear(cx: &mut App, window_id: WindowId) -> bool {
++        cx.update_global::<Self, _>(|this, _| this.overrides.remove(&window_id).is_some())
++    }
++
++    /// Returns the resolved override theme for a window, if any.
++    pub fn theme(cx: &App, window_id: WindowId) -> Option<Arc<Theme>> {
++        cx.try_global::<Self>()
++            .and_then(|this| this.overrides.get(&window_id).map(|o| o.theme.clone()))
++    }
++
++    /// Returns the override theme name for a window, if any (for persistence).
++    pub fn theme_name(cx: &App, window_id: WindowId) -> Option<SharedString> {
++        cx.try_global::<Self>()
++            .and_then(|this| this.overrides.get(&window_id).map(|o| o.theme_name.clone()))
++    }
++
++    /// Returns all `(window, theme name)` overrides (for persistence and
++    /// re-resolution).
++    pub fn entries(cx: &App) -> Vec<(WindowId, SharedString)> {
++        cx.try_global::<Self>()
++            .map(|this| {
++                this.overrides
++                    .iter()
++                    .map(|(id, o)| (*id, o.theme_name.clone()))
++                    .collect()
++            })
++            .unwrap_or_default()
++    }
++
++    /// Sets the active theme for the window currently being drawn: its override
++    /// if present, otherwise the app-wide configured theme. Runs every frame from
++    /// the window-draw hook, so it sets the active theme without notifying
++    /// observers (see [`GlobalTheme::set_active_theme`]).
++    pub fn apply_for_window(cx: &mut App, window_id: WindowId) {
++        let theme =
++            Self::theme(cx, window_id).unwrap_or_else(|| GlobalTheme::configured_theme(cx).clone());
++        GlobalTheme::set_active_theme(cx, theme);
++    }
++}
+diff --git a/crates/theme_selector/src/theme_selector.rs b/crates/theme_selector/src/theme_selector.rs
+index 5fc3217f..62b074d8 100644
+--- a/crates/theme_selector/src/theme_selector.rs
++++ b/crates/theme_selector/src/theme_selector.rs
+@@ -3,15 +3,16 @@ mod icon_theme_selector;
+ use fs::Fs;
+ use fuzzy::{StringMatch, StringMatchCandidate, match_strings};
+ use gpui::{
+-    App, Context, DismissEvent, Entity, EventEmitter, Focusable, Render, UpdateGlobal, WeakEntity,
+-    Window, actions,
++    App, Context, DismissEvent, Entity, EventEmitter, Focusable, Render, SharedString, UpdateGlobal,
++    WeakEntity, Window, WindowId, actions,
+ };
+ use picker::{Picker, PickerDelegate};
+ use settings::{Settings, SettingsStore, update_settings_file};
+ use std::sync::Arc;
+-use theme::{Appearance, SystemAppearance, Theme, ThemeMeta, ThemeRegistry};
++use theme::{Appearance, SystemAppearance, Theme, ThemeMeta, ThemeRegistry, WindowThemeOverrides};
+ use theme_settings::{
+     ThemeAppearanceMode, ThemeName, ThemeSelection, ThemeSettings, appearance_to_mode,
++    clear_window_theme, set_window_theme,
+ };
+ use ui::{ListItem, ListItemSpacing, prelude::*, v_flex};
+ use util::ResultExt;
+@@ -32,7 +33,20 @@ pub fn init(cx: &mut App) {
+     cx.on_action(|action: &zed_actions::theme_selector::Toggle, cx| {
+         let action = action.clone();
+         with_active_or_new_workspace(cx, move |workspace, window, cx| {
+-            toggle_theme_selector(workspace, &action, window, cx);
++            toggle_theme_selector(workspace, action.themes_filter.as_ref(), false, window, cx);
++        });
++    });
++    cx.on_action(|_: &zed_actions::theme::Project, cx| {
++        with_active_or_new_workspace(cx, move |workspace, window, cx| {
++            toggle_theme_selector(workspace, None, true, window, cx);
++        });
++    });
++    cx.on_action(|_: &zed_actions::theme::ClearProject, cx| {
++        with_active_or_new_workspace(cx, move |workspace, window, cx| {
++            let window_id = window.window_handle().window_id();
++            if clear_window_theme(cx, window_id) {
++                workspace.persist_window_theme_override(window, cx);
++            }
+         });
+     });
+     cx.on_action(|action: &zed_actions::icon_theme_selector::Toggle, cx| {
+@@ -45,18 +59,16 @@ pub fn init(cx: &mut App) {
+ 
+ fn toggle_theme_selector(
+     workspace: &mut Workspace,
+-    toggle: &zed_actions::theme_selector::Toggle,
++    themes_filter: Option<&Vec<String>>,
++    window_only: bool,
+     window: &mut Window,
+     cx: &mut Context<Workspace>,
+ ) {
+     let fs = workspace.app_state().fs.clone();
++    let window_id = window_only.then(|| window.window_handle().window_id());
+     workspace.toggle_modal(window, cx, |window, cx| {
+-        let delegate = ThemeSelectorDelegate::new(
+-            cx.entity().downgrade(),
+-            fs,
+-            toggle.themes_filter.as_ref(),
+-            cx,
+-        );
++        let delegate =
++            ThemeSelectorDelegate::new(cx.entity().downgrade(), fs, themes_filter, window_id, cx);
+         ThemeSelector::new(delegate, window, cx)
+     });
+ }
+@@ -148,6 +160,13 @@ struct ThemeSelectorDelegate {
+     selected_theme: Option<Arc<Theme>>,
+     selected_index: usize,
+     selector: WeakEntity<ThemeSelector>,
++    /// When `Some`, the selector applies the theme to this window only (stored
++    /// user-side, keyed by workspace) rather than changing the app-wide `theme`
++    /// setting.
++    window_id: Option<WindowId>,
++    /// The name of the per-window override that was active before the selector
++    /// was opened (if any), used to revert on dismissal in window-only mode.
++    original_window_override: Option<SharedString>,
+ }
+ 
+ impl ThemeSelectorDelegate {
+@@ -155,9 +174,12 @@ impl ThemeSelectorDelegate {
+         selector: WeakEntity<ThemeSelector>,
+         fs: Arc<dyn Fs>,
+         themes_filter: Option<&Vec<String>>,
++        window_id: Option<WindowId>,
+         cx: &mut Context<ThemeSelector>,
+     ) -> Self {
+         let original_theme = cx.theme().clone();
++        let original_window_override =
++            window_id.and_then(|window_id| WindowThemeOverrides::theme_name(cx, window_id));
+         let original_theme_settings = ThemeSettings::get_global(cx).clone();
+         let original_system_appearance = SystemAppearance::global(cx).0;
+ 
+@@ -215,6 +237,8 @@ impl ThemeSelectorDelegate {
+             selection_completed: false,
+             selected_theme: None,
+             selector,
++            window_id,
++            original_window_override,
+         }
+     }
+ 
+@@ -248,24 +272,45 @@ impl ThemeSelectorDelegate {
+     }
+ 
+     fn revert_theme(&mut self, cx: &mut App) {
+-        if !self.selection_completed {
++        if self.selection_completed {
++            return;
++        }
++        if let Some(window_id) = self.window_id {
++            // Window-only mode: restore the override that was active before the
++            // selector was opened (or clear it if there was none). Never touches
++            // the app-wide settings.
++            match &self.original_window_override {
++                Some(theme_name) => {
++                    set_window_theme(cx, window_id, theme_name.clone());
++                }
++                None => {
++                    clear_window_theme(cx, window_id);
++                }
++            }
++        } else {
+             SettingsStore::update_global(cx, |store, _| {
+                 store.override_global(self.original_theme_settings.clone());
+             });
+-            self.selection_completed = true;
+         }
++        self.selection_completed = true;
+     }
+ 
+     fn set_theme(&mut self, new_theme: Arc<Theme>, cx: &mut App) {
+-        // Update the global (in-memory) theme settings.
+-        SettingsStore::update_global(cx, |store, _| {
+-            override_global_theme(
+-                store,
+-                &new_theme,
+-                &self.original_theme_settings.theme,
+-                self.original_system_appearance,
+-            )
+-        });
++        if let Some(window_id) = self.window_id {
++            // Window-only mode: preview the theme on this window alone, without
++            // touching the global (in-memory or on-disk) theme settings.
++            set_window_theme(cx, window_id, new_theme.name.clone());
++        } else {
++            // Update the global (in-memory) theme settings.
++            SettingsStore::update_global(cx, |store, _| {
++                override_global_theme(
++                    store,
++                    &new_theme,
++                    &self.original_theme_settings.theme,
++                    self.original_system_appearance,
++                )
++            });
++        }
+ 
+         self.new_theme = new_theme;
+     }
+@@ -389,20 +434,38 @@ impl PickerDelegate for ThemeSelectorDelegate {
+     fn confirm(
+         &mut self,
+         _secondary: bool,
+-        _window: &mut Window,
++        window: &mut Window,
+         cx: &mut Context<Picker<ThemeSelectorDelegate>>,
+     ) {
+         self.selection_completed = true;
+ 
+-        let theme_name: Arc<str> = self.new_theme.name.as_str().into();
+-        let theme_appearance = self.new_theme.appearance;
+-        let system_appearance = SystemAppearance::global(cx).0;
++        if let Some(window_id) = self.window_id {
++            // Window-only mode: the override is already applied to this window
++            // (via the preview in `set_theme`). Persist it user-side, keyed by
++            // this window's workspace, so it survives a restart. The app-wide
++            // `theme` setting is intentionally left untouched.
++            telemetry::event!(
++                "Settings Changed",
++                setting = "window_theme",
++                value = self.new_theme.name.as_str()
++            );
++            set_window_theme(cx, window_id, self.new_theme.name.clone());
++            if let Some(workspace) = workspace::Workspace::for_window(window, cx) {
++                workspace.update(cx, |workspace, cx| {
++                    workspace.persist_window_theme_override(window, cx);
++                });
++            }
++        } else {
++            let theme_name: Arc<str> = self.new_theme.name.as_str().into();
++            let theme_appearance = self.new_theme.appearance;
++            let system_appearance = SystemAppearance::global(cx).0;
+ 
+-        telemetry::event!("Settings Changed", setting = "theme", value = theme_name);
++            telemetry::event!("Settings Changed", setting = "theme", value = theme_name);
+ 
+-        update_settings_file(self.fs.clone(), cx, move |settings, _| {
+-            theme_settings::set_theme(settings, theme_name, theme_appearance, system_appearance);
+-        });
++            update_settings_file(self.fs.clone(), cx, move |settings, _| {
++                theme_settings::set_theme(settings, theme_name, theme_appearance, system_appearance);
++            });
++        }
+ 
+         self.selector
+             .update(cx, |_, cx| {
+diff --git a/crates/theme_settings/src/theme_settings.rs b/crates/theme_settings/src/theme_settings.rs
+index 192dfa54..6876b75f 100644
+--- a/crates/theme_settings/src/theme_settings.rs
++++ b/crates/theme_settings/src/theme_settings.rs
+@@ -12,13 +12,13 @@ use std::sync::Arc;
+ 
+ use ::settings::{IntoGpui, Settings, SettingsStore};
+ use anyhow::{Context as _, Result};
+-use gpui::{App, Font, HighlightStyle, Pixels, Refineable, px};
++use gpui::{App, Font, HighlightStyle, Pixels, Refineable, SharedString, WindowId, px};
+ use gpui_util::ResultExt;
+ use theme::{
+     AccentColors, Appearance, AppearanceContent, DEFAULT_DARK_THEME, DEFAULT_ICON_THEME_NAME,
+     GlobalTheme, LoadThemes, PlayerColor, PlayerColors, StatusColors, SyntaxTheme,
+     SystemAppearance, SystemColors, Theme, ThemeColors, ThemeFamily, ThemeRegistry,
+-    ThemeSettingsProvider, ThemeStyles, default_color_scales, try_parse_color,
++    ThemeSettingsProvider, ThemeStyles, WindowThemeOverrides, default_color_scales, try_parse_color,
+ };
+ 
+ pub use crate::schema::{
+@@ -195,9 +195,52 @@ fn configured_icon_theme(cx: &mut App) -> Arc<theme::IconTheme> {
+ pub fn reload_theme(cx: &mut App) {
+     let theme = configured_theme(cx);
+     GlobalTheme::update_theme(cx, theme);
++    reresolve_window_theme_overrides(cx);
+     cx.refresh_windows();
+ }
+ 
++/// Resolves a theme by name against the registry and applies the user's theme
++/// overrides, matching how the app-wide configured theme is built. Returns
++/// `None` if the theme is not found.
++pub fn resolve_theme(cx: &App, theme_name: &str) -> Option<Arc<Theme>> {
++    let theme = ThemeRegistry::global(cx).get(theme_name).ok()?;
++    Some(ThemeSettings::get_global(cx).apply_theme_overrides(theme))
++}
++
++/// Sets a per-window theme override by name (applying the user's theme overrides)
++/// and redraws so the window immediately reflects it. Returns whether the theme
++/// name resolved to a known theme. The override is stored user-side, never in a
++/// project's settings.
++pub fn set_window_theme(cx: &mut App, window_id: WindowId, theme_name: SharedString) -> bool {
++    let Some(theme) = resolve_theme(cx, &theme_name) else {
++        return false;
++    };
++    WindowThemeOverrides::set_resolved(cx, window_id, theme_name, theme);
++    cx.refresh_windows();
++    true
++}
++
++/// Clears a window's theme override, falling back to the configured theme, and
++/// redraws. Returns whether an override was present.
++pub fn clear_window_theme(cx: &mut App, window_id: WindowId) -> bool {
++    let cleared = WindowThemeOverrides::clear(cx, window_id);
++    if cleared {
++        cx.refresh_windows();
++    }
++    cleared
++}
++
++/// Re-resolves all stored per-window overrides against the current registry and
++/// user overrides, so overridden windows reflect updated theme definitions after
++/// a settings or appearance change.
++fn reresolve_window_theme_overrides(cx: &mut App) {
++    for (window_id, theme_name) in WindowThemeOverrides::entries(cx) {
++        if let Some(theme) = resolve_theme(cx, &theme_name) {
++            WindowThemeOverrides::set_resolved(cx, window_id, theme_name, theme);
++        }
++    }
++}
++
+ /// Reloads the current icon theme from settings.
+ pub fn reload_icon_theme(cx: &mut App) {
+     let icon_theme = configured_icon_theme(cx);
+diff --git a/crates/workspace/src/persistence.rs b/crates/workspace/src/persistence.rs
+index 1295ce60..759ec6ee 100644
+--- a/crates/workspace/src/persistence.rs
++++ b/crates/workspace/src/persistence.rs
+@@ -1044,6 +1044,15 @@ impl Domain for WorkspaceDb {
+             ALTER TABLE workspaces ADD COLUMN identity_paths TEXT;
+             ALTER TABLE workspaces ADD COLUMN identity_paths_order TEXT;
+         ),
++        sql!(
++            CREATE TABLE window_theme_overrides (
++                workspace_id INTEGER PRIMARY KEY,
++                theme_name TEXT NOT NULL,
++                FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id)
++                ON DELETE CASCADE
++                ON UPDATE CASCADE
++            );
++        ),
+     ];
+ 
+     // Allow recovering from bad migration that was initially shipped to nightly
+@@ -2411,6 +2420,28 @@ impl WorkspaceDb {
+         }
+     }
+ 
++    query! {
++        pub async fn save_window_theme_override(workspace_id: WorkspaceId, theme_name: String) -> Result<()> {
++            INSERT INTO window_theme_overrides(workspace_id, theme_name)
++            VALUES (?1, ?2)
++            ON CONFLICT(workspace_id) DO UPDATE SET theme_name = ?2
++        }
++    }
++
++    query! {
++        pub async fn delete_window_theme_override(workspace_id: WorkspaceId) -> Result<()> {
++            DELETE FROM window_theme_overrides
++            WHERE workspace_id = ?
++        }
++    }
++
++    query! {
++        pub fn window_theme_override(workspace_id: WorkspaceId) -> Result<Option<String>> {
++            SELECT theme_name FROM window_theme_overrides
++            WHERE workspace_id = ?
++        }
++    }
++
+     #[cfg(test)]
+     query! {
+         pub(crate) async fn set_timestamp_for_tests(workspace_id: WorkspaceId, timestamp: String) -> Result<()> {
+diff --git a/crates/workspace/src/workspace.rs b/crates/workspace/src/workspace.rs
+index a1b58898..893d9798 100644
+--- a/crates/workspace/src/workspace.rs
++++ b/crates/workspace/src/workspace.rs
+@@ -6891,6 +6891,31 @@ impl Workspace {
+         self.session_id.clone()
+     }
+ 
++    /// Persists (or clears) this workspace's per-window theme override so it is
++    /// restored on the next launch. The override is stored in the user's
++    /// workspace database keyed by this workspace — never in project settings —
++    /// so the user, not an opened repository, decides per-window appearance.
++    /// No-op until the workspace has a database id.
++    pub fn persist_window_theme_override(&self, window: &Window, cx: &mut App) {
++        let Some(workspace_id) = self.database_id else {
++            return;
++        };
++        let window_id = window.window_handle().window_id();
++        let theme_name = theme::WindowThemeOverrides::theme_name(cx, window_id);
++        let db = WorkspaceDb::global(cx);
++        cx.background_executor()
++            .spawn(async move {
++                match theme_name {
++                    Some(theme_name) => db
++                        .save_window_theme_override(workspace_id, theme_name.to_string())
++                        .await
++                        .log_err(),
++                    None => db.delete_window_theme_override(workspace_id).await.log_err(),
++                };
++            })
++            .detach();
++    }
++
+     fn save_window_bounds(&self, window: &mut Window, cx: &mut App) -> Task<()> {
+         let Some(display) = window.display(cx) else {
+             return Task::ready(());
+@@ -7325,6 +7350,14 @@ impl Workspace {
+                     });
+                 }
+ 
++                // Restore a per-window theme override saved for this workspace.
++                if let Ok(Some(theme_name)) =
++                    WorkspaceDb::global(cx).window_theme_override(serialized_workspace.id)
++                {
++                    let window_id = window.window_handle().window_id();
++                    theme_settings::set_window_theme(cx, window_id, theme_name.into());
++                }
++
+                 cx.notify();
+             })?;
+ 
+diff --git a/crates/zed_actions/src/lib.rs b/crates/zed_actions/src/lib.rs
+index 9ac6f36b..6fc2f804 100644
+--- a/crates/zed_actions/src/lib.rs
++++ b/crates/zed_actions/src/lib.rs
+@@ -397,7 +397,19 @@ pub mod feedback {
+ pub mod theme {
+     use gpui::actions;
+ 
+-    actions!(theme, [ToggleMode]);
++    actions!(
++        theme,
++        [
++            ToggleMode,
++            /// Toggles the theme selector, applying the chosen theme to the
++            /// current project's window only (stored user-side, keyed by
++            /// workspace) instead of changing the app-wide `theme` setting.
++            Project,
++            /// Clears the current project window's theme override, falling back
++            /// to the app-wide configured theme.
++            ClearProject
++        ]
++    );
+ }
+ 
+ pub mod theme_selector {
+-- 
+2.54.0
+
+
+From 7d1b0146da2da3a7e2f679b2b95f89c4028d48b1 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?A=CC=82nderson=20Q?= <anquadros@gmail.com>
+Date: Sun, 7 Jun 2026 10:54:23 -0300
+Subject: [PATCH 2/3] workspace: test per-window theme override persistence
+
+Round-trip save/read, upsert on conflict, delete, and cascade-on-
+workspace-delete for the window_theme_overrides table.
+---
+ crates/workspace/src/persistence.rs | 65 +++++++++++++++++++++++++++++
+ 1 file changed, 65 insertions(+)
+
+diff --git a/crates/workspace/src/persistence.rs b/crates/workspace/src/persistence.rs
+index 759ec6ee..a004c229 100644
+--- a/crates/workspace/src/persistence.rs
++++ b/crates/workspace/src/persistence.rs
+@@ -3307,6 +3307,71 @@ mod tests {
+         assert_eq!(test_text_1, "test-text-1");
+     }
+ 
++    #[gpui::test]
++    async fn test_window_theme_override() {
++        zlog::init_test();
++
++        let db = WorkspaceDb::open_test_db("test_window_theme_override").await;
++
++        let workspace = SerializedWorkspace {
++            id: WorkspaceId(1),
++            paths: PathList::new(&["/tmp"]),
++            identity_paths: None,
++            location: SerializedWorkspaceLocation::Local,
++            center_group: Default::default(),
++            window_bounds: Default::default(),
++            display: Default::default(),
++            docks: Default::default(),
++            centered_layout: false,
++            bookmarks: Default::default(),
++            breakpoints: Default::default(),
++            session_id: None,
++            window_id: None,
++            user_toolchains: Default::default(),
++        };
++        db.save_workspace(workspace).await;
++
++        // No override until one is saved.
++        assert_eq!(db.window_theme_override(WorkspaceId(1)).unwrap(), None);
++
++        // Save an override and read it back.
++        db.save_window_theme_override(WorkspaceId(1), "Ayu Dark".to_string())
++            .await
++            .unwrap();
++        assert_eq!(
++            db.window_theme_override(WorkspaceId(1)).unwrap(),
++            Some("Ayu Dark".to_string())
++        );
++
++        // Saving again upserts (ON CONFLICT) rather than erroring or duplicating.
++        db.save_window_theme_override(WorkspaceId(1), "Gruvbox Dark".to_string())
++            .await
++            .unwrap();
++        assert_eq!(
++            db.window_theme_override(WorkspaceId(1)).unwrap(),
++            Some("Gruvbox Dark".to_string())
++        );
++
++        // Clearing removes it, falling back to the configured theme.
++        db.delete_window_theme_override(WorkspaceId(1))
++            .await
++            .unwrap();
++        assert_eq!(db.window_theme_override(WorkspaceId(1)).unwrap(), None);
++
++        // Deleting the parent workspace cascades the override away (FOREIGN KEY
++        // ... ON DELETE CASCADE), so no orphaned row outlives its workspace.
++        db.save_window_theme_override(WorkspaceId(1), "Ayu Dark".to_string())
++            .await
++            .unwrap();
++        db.write(|conn| {
++            conn.exec_bound::<i32>(sql!(DELETE FROM workspaces WHERE workspace_id = ?))
++                .unwrap()(1)
++            .unwrap();
++        })
++        .await;
++        assert_eq!(db.window_theme_override(WorkspaceId(1)).unwrap(), None);
++    }
++
+     fn group(axis: Axis, children: Vec<SerializedPaneGroup>) -> SerializedPaneGroup {
+         SerializedPaneGroup::Group {
+             axis: SerializedAxis(axis),
+-- 
+2.54.0
+
+
+From f81b82a22ec9100d4ed3f20f1f7139921d077e29 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?A=CC=82nderson=20Q?= <anquadros@gmail.com>
+Date: Mon, 7 Sep 2026 12:27:29 -0300
+Subject: [PATCH 3/3] theme: Move per-window theme swap out of gpui core
+
+Address review feedback on the per-window theme override design: instead of
+threading a draw observer and a global-mutation-without-notify escape hatch
+through gpui, the active theme now lives in GlobalTheme behind a RefCell and
+is set once per frame from Workspace::render, before anything reads
+cx.theme(). gpui itself is untouched.
+
+ActiveTheme::theme() now returns an owned Arc<Theme> instead of a borrowed
+reference, which is why this diff is larger than the theme crate alone: every
+call site chaining a method off the old reference needed a let binding, and a
+few passed cx.theme() directly where a &Theme was expected.
+---
+ crates/acp_tools/src/acp_tools.rs             |  3 +-
+ .../configure_context_server_modal.rs         |  3 +-
+ crates/agent_ui/src/inline_prompt_editor.rs   |  6 +-
+ .../src/agent_panel_onboarding_card.rs        |  3 +-
+ .../src/session/running/breakpoint_list.rs    |  6 +-
+ .../src/session/running/console.rs            |  2 +-
+ .../src/session/running/variable_list.rs      |  3 +-
+ crates/diagnostics/src/diagnostic_renderer.rs |  3 +-
+ .../edit_prediction/src/onboarding_modal.rs   |  3 +-
+ crates/editor/src/code_context_menus.rs       |  3 +-
+ crates/editor/src/display_map/inlay_map.rs    |  3 +-
+ crates/editor/src/edit_prediction.rs          | 12 ++--
+ crates/editor/src/editor.rs                   |  5 +-
+ crates/editor/src/editor_tests.rs             |  4 +-
+ crates/editor/src/element.rs                  | 10 +--
+ crates/editor/src/element/header.rs           |  3 +-
+ crates/editor/src/hover_popover.rs            |  3 +-
+ crates/editor/src/semantic_tokens.rs          |  3 +-
+ crates/git_ui/src/git_graph.rs                | 15 +++--
+ crates/git_ui/src/git_panel.rs                |  3 +-
+ crates/gpui/src/app.rs                        | 44 -------------
+ crates/gpui/src/window.rs                     |  9 ---
+ crates/inspector_ui/src/inspector.rs          |  3 +-
+ crates/keymap_editor/src/keymap_editor.rs     |  9 ++-
+ .../src/ui_components/keystroke_input.rs      |  3 +-
+ crates/language/src/buffer.rs                 |  3 +-
+ .../src/highlights_tree_view.rs               |  9 ++-
+ crates/language_tools/src/syntax_tree_view.rs |  3 +-
+ crates/markdown/src/markdown.rs               | 14 ++--
+ crates/markdown/src/mermaid.rs                | 11 ++--
+ crates/onboarding/src/basics_page.rs          |  3 +-
+ .../src/platforms/platform_linux.rs           |  3 +-
+ crates/project_panel/src/project_panel.rs     |  3 +-
+ crates/search/src/buffer_search.rs            |  3 +-
+ crates/search/src/project_search.rs           |  3 +-
+ .../settings_ui/src/components/input_field.rs |  3 +-
+ .../src/pages/tool_permissions_setup.rs       |  6 +-
+ crates/sidebar/src/sidebar.rs                 | 15 +++--
+ crates/terminal_view/src/terminal_element.rs  |  4 +-
+ crates/terminal_view/src/terminal_view.rs     |  3 +-
+ crates/theme/src/theme.rs                     | 65 ++++++++++---------
+ crates/theme/src/window_theme.rs              | 12 +---
+ crates/title_bar/src/collab.rs                |  3 +-
+ crates/ui/src/components/ai/thread_item.rs    |  6 +-
+ crates/ui/src/components/keybinding_hint.rs   |  5 +-
+ crates/ui/src/components/scrollbar.rs         |  3 +-
+ crates/ui/src/components/toggle.rs            |  5 +-
+ crates/ui_input/src/input_field.rs            |  3 +-
+ crates/workspace/src/welcome.rs               |  3 +-
+ crates/workspace/src/workspace.rs             |  4 ++
+ 50 files changed, 185 insertions(+), 174 deletions(-)
+
+diff --git a/crates/acp_tools/src/acp_tools.rs b/crates/acp_tools/src/acp_tools.rs
+index a2fcfe53..6b071e70 100644
+--- a/crates/acp_tools/src/acp_tools.rs
++++ b/crates/acp_tools/src/acp_tools.rs
+@@ -400,7 +400,8 @@ impl AcpTools {
+         let theme_settings = ThemeSettings::get_global(cx);
+         let text_style = window.text_style();
+ 
+-        let colors = cx.theme().colors();
++        let active_theme = cx.theme();
++        let colors = active_theme.colors();
+         let expanded = self.expanded.contains(&index);
+ 
+         v_flex()
+diff --git a/crates/agent_ui/src/agent_configuration/configure_context_server_modal.rs b/crates/agent_ui/src/agent_configuration/configure_context_server_modal.rs
+index 5ccc901b..29e6fe19 100644
+--- a/crates/agent_ui/src/agent_configuration/configure_context_server_modal.rs
++++ b/crates/agent_ui/src/agent_configuration/configure_context_server_modal.rs
+@@ -1339,7 +1339,8 @@ fn wait_for_context_server(
+ 
+ pub(crate) fn default_markdown_style(window: &Window, cx: &App) -> MarkdownStyle {
+     let theme_settings = ThemeSettings::get_global(cx);
+-    let colors = cx.theme().colors();
++    let active_theme = cx.theme();
++    let colors = active_theme.colors();
+     let mut text_style = window.text_style();
+     text_style.refine(&TextStyleRefinement {
+         font_family: Some(theme_settings.ui_font.family.clone()),
+diff --git a/crates/agent_ui/src/inline_prompt_editor.rs b/crates/agent_ui/src/inline_prompt_editor.rs
+index b5fca12f..f74b0d42 100644
+--- a/crates/agent_ui/src/inline_prompt_editor.rs
++++ b/crates/agent_ui/src/inline_prompt_editor.rs
+@@ -251,7 +251,8 @@ impl<T: 'static> Render for PromptEditor<T> {
+ 
+ fn markdown_style(window: &Window, cx: &App) -> MarkdownStyle {
+     let theme_settings = ThemeSettings::get_global(cx);
+-    let colors = cx.theme().colors();
++    let active_theme = cx.theme();
++    let colors = active_theme.colors();
+     let mut text_style = window.text_style();
+ 
+     text_style.refine(&TextStyleRefinement {
+@@ -1124,7 +1125,8 @@ impl<T: 'static> PromptEditor<T> {
+     }
+ 
+     fn render_editor(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+-        let colors = cx.theme().colors();
++        let active_theme = cx.theme();
++        let colors = active_theme.colors();
+ 
+         div()
+             .size_full()
+diff --git a/crates/ai_onboarding/src/agent_panel_onboarding_card.rs b/crates/ai_onboarding/src/agent_panel_onboarding_card.rs
+index d4070b70..b7164b5a 100644
+--- a/crates/ai_onboarding/src/agent_panel_onboarding_card.rs
++++ b/crates/ai_onboarding/src/agent_panel_onboarding_card.rs
+@@ -23,7 +23,8 @@ impl ParentElement for AgentPanelOnboardingCard {
+ 
+ impl RenderOnce for AgentPanelOnboardingCard {
+     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+-        let color = cx.theme().colors();
++        let active_theme = cx.theme();
++        let color = active_theme.colors();
+ 
+         div().min_w_0().p_2p5().bg(color.editor_background).child(
+             div()
+diff --git a/crates/debugger_ui/src/session/running/breakpoint_list.rs b/crates/debugger_ui/src/session/running/breakpoint_list.rs
+index 1af4e7a0..1c76fdad 100644
+--- a/crates/debugger_ui/src/session/running/breakpoint_list.rs
++++ b/crates/debugger_ui/src/session/running/breakpoint_list.rs
+@@ -794,7 +794,8 @@ impl Render for BreakpointList {
+                             .when(
+                                 self.input.focus_handle(cx).contains_focused(window, cx),
+                                 |this| {
+-                                    let colors = cx.theme().colors();
++                                    let active_theme = cx.theme();
++                                    let colors = active_theme.colors();
+ 
+                                     let border_color = if self.input.read(cx).read_only(cx) {
+                                         colors.border_disabled
+@@ -1360,7 +1361,8 @@ impl BreakpointOptionsStrip {
+         move |this: Div| {
+             // Avoid layout shifts in case there's no colored border
+             let this = this.border_1().rounded_sm();
+-            let color = cx.theme().colors();
++            let active_theme = cx.theme();
++            let color = active_theme.colors();
+ 
+             if self.is_selected && self.strip_mode == Some(kind) {
+                 if self.focus_handle.is_focused(window) {
+diff --git a/crates/debugger_ui/src/session/running/console.rs b/crates/debugger_ui/src/session/running/console.rs
+index 91063734..749cbfc6 100644
+--- a/crates/debugger_ui/src/session/running/console.rs
++++ b/crates/debugger_ui/src/session/running/console.rs
+@@ -217,7 +217,7 @@ impl Console {
+                         let style = HighlightStyle {
+                             color: Some(terminal_view::terminal_element::convert_color(
+                                 &color,
+-                                cx.theme(),
++                                &cx.theme(),
+                             )),
+                             ..Default::default()
+                         };
+diff --git a/crates/debugger_ui/src/session/running/variable_list.rs b/crates/debugger_ui/src/session/running/variable_list.rs
+index cdb5b812..9df36806 100644
+--- a/crates/debugger_ui/src/session/running/variable_list.rs
++++ b/crates/debugger_ui/src/session/running/variable_list.rs
+@@ -1604,7 +1604,8 @@ struct EntryColors {
+ }
+ 
+ fn get_entry_color(cx: &Context<VariableList>) -> EntryColors {
+-    let colors = cx.theme().colors();
++    let active_theme = cx.theme();
++    let colors = active_theme.colors();
+ 
+     EntryColors {
+         default: colors.panel_background,
+diff --git a/crates/diagnostics/src/diagnostic_renderer.rs b/crates/diagnostics/src/diagnostic_renderer.rs
+index f44e6a4e..f759d5e5 100644
+--- a/crates/diagnostics/src/diagnostic_renderer.rs
++++ b/crates/diagnostics/src/diagnostic_renderer.rs
+@@ -201,7 +201,8 @@ pub(crate) struct DiagnosticBlock {
+ impl DiagnosticBlock {
+     pub fn render_block(&self, editor: WeakEntity<Editor>, bcx: &BlockContext) -> AnyElement {
+         let cx = &bcx.app;
+-        let status_colors = cx.theme().status();
++        let active_theme = cx.theme();
++        let status_colors = active_theme.status();
+ 
+         let max_width = bcx.em_width * 120.;
+ 
+diff --git a/crates/edit_prediction/src/onboarding_modal.rs b/crates/edit_prediction/src/onboarding_modal.rs
+index 0147fb75..ac1be8ba 100644
+--- a/crates/edit_prediction/src/onboarding_modal.rs
++++ b/crates/edit_prediction/src/onboarding_modal.rs
+@@ -119,7 +119,8 @@ impl Render for ZedPredictModal {
+     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+         let window_height = window.viewport_size().height;
+         let max_height = window_height - px(200.);
+-        let color = cx.theme().colors();
++        let active_theme = cx.theme();
++        let color = active_theme.colors();
+ 
+         v_flex()
+             .id("edit-prediction-onboarding")
+diff --git a/crates/editor/src/code_context_menus.rs b/crates/editor/src/code_context_menus.rs
+index d515692a..5bf7f3e7 100644
+--- a/crates/editor/src/code_context_menus.rs
++++ b/crates/editor/src/code_context_menus.rs
+@@ -1982,7 +1982,8 @@ impl CodeActionsMenu {
+                     .map(|(ix, action)| {
+                         let item_ix = range.start + ix;
+                         let selected = item_ix == selected_item;
+-                        let colors = cx.theme().colors();
++                        let active_theme = cx.theme();
++                        let colors = active_theme.colors();
+ 
+                         ListItem::new(item_ix)
+                             .inset(true)
+diff --git a/crates/editor/src/display_map/inlay_map.rs b/crates/editor/src/display_map/inlay_map.rs
+index 016417ce..56342666 100644
+--- a/crates/editor/src/display_map/inlay_map.rs
++++ b/crates/editor/src/display_map/inlay_map.rs
+@@ -342,7 +342,8 @@ impl<'a> Iterator for InlayChunks<'a> {
+                         renderer = Some(ChunkRenderer {
+                             id: ChunkRendererId::Inlay(inlay.id),
+                             render: Arc::new(move |cx| {
+-                                let colors = cx.theme().colors();
++                                let active_theme = cx.theme();
++                                let colors = active_theme.colors();
+                                 div()
+                                     .flex()
+                                     .flex_row()
+diff --git a/crates/editor/src/edit_prediction.rs b/crates/editor/src/edit_prediction.rs
+index 7b2ee9c2..36a1d1d9 100644
+--- a/crates/editor/src/edit_prediction.rs
++++ b/crates/editor/src/edit_prediction.rs
+@@ -1286,7 +1286,8 @@ impl Editor {
+                                     })
+                                     .id("edit_prediction_cursor_popover_keybind")
+                                     .when(keybind_display.missing_accept_keystroke, |el| {
+-                                        let status_colors = cx.theme().status();
++                                        let active_theme = cx.theme();
++                                        let status_colors = active_theme.status();
+ 
+                                         el.bg(status_colors.error_background)
+                                             .border_color(status_colors.error.opacity(0.6))
+@@ -2030,7 +2031,8 @@ impl Editor {
+                     .rounded_r_lg()
+                     .id("edit_prediction_diff_popover_keybind")
+                     .when(!has_keybind, |el| {
+-                        let status_colors = cx.theme().status();
++                        let active_theme = cx.theme();
++                        let status_colors = active_theme.status();
+ 
+                         el.bg(status_colors.error_background)
+                             .border_color(status_colors.error.opacity(0.6))
+@@ -2248,7 +2250,8 @@ impl Editor {
+             .border_color(Self::edit_prediction_callout_popover_border_color(cx))
+             .shadow_xs()
+             .when(!has_keybind, |el| {
+-                let status_colors = cx.theme().status();
++                let active_theme = cx.theme();
++                let status_colors = active_theme.status();
+ 
+                 el.bg(status_colors.error_background)
+                     .border_color(status_colors.error.opacity(0.6))
+@@ -2311,7 +2314,8 @@ impl Editor {
+             .border_color(Self::edit_prediction_callout_popover_border_color(cx))
+             .shadow_xs()
+             .when(!has_keybind, |el| {
+-                let status_colors = cx.theme().status();
++                let active_theme = cx.theme();
++                let status_colors = active_theme.status();
+ 
+                 el.bg(status_colors.error_background)
+                     .border_color(status_colors.error.opacity(0.6))
+diff --git a/crates/editor/src/editor.rs b/crates/editor/src/editor.rs
+index 8f7f0b43..d823d0ca 100644
+--- a/crates/editor/src/editor.rs
++++ b/crates/editor/src/editor.rs
+@@ -8910,7 +8910,7 @@ impl Editor {
+         let buffer = &snapshot.buffer_snapshot();
+         let start = buffer.anchor_before(MultiBufferOffset(0));
+         let end = buffer.anchor_after(buffer.len());
+-        self.sorted_background_highlights_in_range(start..end, &snapshot, cx.theme())
++        self.sorted_background_highlights_in_range(start..end, &snapshot, &cx.theme())
+     }
+ 
+     #[cfg(any(test, feature = "test-support"))]
+@@ -11699,7 +11699,8 @@ impl ui_input::ErasedEditor for ErasedEditorImpl {
+ 
+     fn render(&self, _: &mut Window, cx: &App) -> AnyElement {
+         let settings = ThemeSettings::get_global(cx);
+-        let theme_color = cx.theme().colors();
++        let active_theme = cx.theme();
++        let theme_color = active_theme.colors();
+ 
+         let text_style = TextStyle {
+             font_family: settings.ui_font.family.clone(),
+diff --git a/crates/editor/src/editor_tests.rs b/crates/editor/src/editor_tests.rs
+index 1ce8c26a..8e9bdaae 100644
+--- a/crates/editor/src/editor_tests.rs
++++ b/crates/editor/src/editor_tests.rs
+@@ -19893,7 +19893,7 @@ fn test_highlighted_ranges(cx: &mut TestAppContext) {
+         let highlighted_ranges = editor.sorted_background_highlights_in_range(
+             anchor_range(Point::new(3, 4)..Point::new(7, 4)),
+             &snapshot,
+-            cx.theme(),
++            &cx.theme(),
+         );
+         assert_eq!(
+             highlighted_ranges,
+@@ -19920,7 +19920,7 @@ fn test_highlighted_ranges(cx: &mut TestAppContext) {
+             editor.sorted_background_highlights_in_range(
+                 anchor_range(Point::new(5, 6)..Point::new(6, 4)),
+                 &snapshot,
+-                cx.theme(),
++                &cx.theme(),
+             ),
+             &[(
+                 DisplayPoint::new(DisplayRow(6), 3)..DisplayPoint::new(DisplayRow(6), 5),
+diff --git a/crates/editor/src/element.rs b/crates/editor/src/element.rs
+index 74422849..fbd36fba 100644
+--- a/crates/editor/src/element.rs
++++ b/crates/editor/src/element.rs
+@@ -4514,7 +4514,8 @@ impl EditorElement {
+         highlighted_ranges: &mut Vec<(Range<DisplayPoint>, Hsla)>,
+         cx: &mut App,
+     ) {
+-        let colors = cx.theme().colors();
++        let active_theme = cx.theme();
++        let colors = active_theme.colors();
+ 
+         let visible_start =
+             DisplayPoint::new(start_row, 0).to_offset(&snapshot.display_snapshot, Bias::Left);
+@@ -8113,7 +8114,7 @@ impl Element for EditorElement {
+                                 editor.read(cx).background_highlights_in_range(
+                                     start_anchor..end_anchor,
+                                     &snapshot.display_snapshot,
+-                                    cx.theme(),
++                                    &cx.theme(),
+                                 )
+                             } else {
+                                 editor.update(cx, |editor, cx| {
+@@ -8138,7 +8139,7 @@ impl Element for EditorElement {
+                                     editor.background_highlights_in_range(
+                                         start_anchor..end_anchor,
+                                         &snapshot.display_snapshot,
+-                                        cx.theme(),
++                                        &cx.theme(),
+                                     )
+                                 })
+                             }
+@@ -8151,7 +8152,8 @@ impl Element for EditorElement {
+                         hollow_border: Hsla,
+                     }
+ 
+-                    let colors = cx.theme().colors();
++                    let active_theme = cx.theme();
++                    let colors = active_theme.colors();
+                     let added_diff_hunk_colors = DiffHunkHighlightColors {
+                         filled_background: colors.editor_diff_hunk_added_background,
+                         hollow_background: colors.editor_diff_hunk_added_hollow_background,
+diff --git a/crates/editor/src/element/header.rs b/crates/editor/src/element/header.rs
+index 02dfebdf..002f75fe 100644
+--- a/crates/editor/src/element/header.rs
++++ b/crates/editor/src/element/header.rs
+@@ -662,7 +662,8 @@ pub(crate) fn render_buffer_header(
+         (None, None)
+     };
+     let focus_handle = editor_read.focus_handle(cx);
+-    let colors = cx.theme().colors();
++    let active_theme = cx.theme();
++    let colors = active_theme.colors();
+ 
+     let header = div()
+         .id(("buffer-header", buffer_id.to_proto()))
+diff --git a/crates/editor/src/hover_popover.rs b/crates/editor/src/hover_popover.rs
+index c915232b..e86cb622 100644
+--- a/crates/editor/src/hover_popover.rs
++++ b/crates/editor/src/hover_popover.rs
+@@ -382,7 +382,8 @@ fn show_hover(
+                 })??;
+ 
+                 let (background_color, border_color) = cx.update(|_, cx| {
+-                    let status_colors = cx.theme().status();
++                    let active_theme = cx.theme();
++                    let status_colors = active_theme.status();
+                     match local_diagnostic.diagnostic.severity {
+                         DiagnosticSeverity::ERROR => {
+                             (status_colors.error_background, status_colors.error_border)
+diff --git a/crates/editor/src/semantic_tokens.rs b/crates/editor/src/semantic_tokens.rs
+index 23ce7c41..2e2f6dd5 100644
+--- a/crates/editor/src/semantic_tokens.rs
++++ b/crates/editor/src/semantic_tokens.rs
+@@ -301,7 +301,8 @@ impl Editor {
+                                     ) else {
+                                         continue;
+                                     };
+-                                    let theme = cx.theme().syntax();
++                                    let active_theme = cx.theme();
++                                    let theme = active_theme.syntax();
+                                     token_highlights.reserve(2 * server_tokens.len());
+                                     token_highlights.extend(buffer_into_editor_highlights(
+                                         &server_tokens,
+diff --git a/crates/git_ui/src/git_graph.rs b/crates/git_ui/src/git_graph.rs
+index e95c71a2..ff5fa50f 100644
+--- a/crates/git_ui/src/git_graph.rs
++++ b/crates/git_ui/src/git_graph.rs
+@@ -1447,7 +1447,8 @@ impl GitGraph {
+         cx.on_focus(&focus_handle, window, |_, _, cx| cx.notify())
+             .detach();
+ 
+-        let accent_colors = cx.theme().accents();
++        let active_theme = cx.theme();
++        let accent_colors = active_theme.accents();
+         let graph = GraphData::new(accent_colors_count(accent_colors));
+         let log_source = log_source.unwrap_or_default();
+         let log_order = LogOrder::default();
+@@ -1768,7 +1769,8 @@ impl GitGraph {
+                     author_name = "".into();
+                 }
+ 
+-                let accent_colors = cx.theme().accents();
++                let active_theme = cx.theme();
++                let accent_colors = active_theme.accents();
+                 let accent_color = accent_colors
+                     .0
+                     .get(commit.color_idx)
+@@ -2544,7 +2546,8 @@ impl GitGraph {
+     }
+ 
+     fn render_search_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+-        let color = cx.theme().colors();
++        let active_theme = cx.theme();
++        let color = active_theme.colors();
+         let query_focus_handle = self
+             .search_state
+             .editor
+@@ -2718,7 +2721,8 @@ impl GitGraph {
+             .as_ref()
+             .map(|branch| SharedString::from(branch.name().to_string()));
+ 
+-        let accent_colors = cx.theme().accents();
++        let active_theme = cx.theme();
++        let accent_colors = active_theme.accents();
+         let accent_color = accent_colors
+             .0
+             .get(commit_entry.color_idx)
+@@ -3206,7 +3210,8 @@ impl GitGraph {
+                 graph_canvas_bounds.set(Some(bounds));
+ 
+                 window.paint_layer(bounds, |window| {
+-                    let accent_colors = cx.theme().accents();
++                    let active_theme = cx.theme();
++                    let accent_colors = active_theme.accents();
+ 
+                     let hover_bg = cx.theme().colors().element_hover.opacity(0.6);
+                     let selected_bg = if is_focused {
+diff --git a/crates/git_ui/src/git_panel.rs b/crates/git_ui/src/git_panel.rs
+index 8dd47948..c488ddf3 100644
+--- a/crates/git_ui/src/git_panel.rs
++++ b/crates/git_ui/src/git_panel.rs
+@@ -6290,7 +6290,8 @@ impl GitPanel {
+         let state_opacity_step = 0.04;
+ 
+         let info_color = cx.theme().status().info;
+-        let colors = cx.theme().colors();
++        let active_theme = cx.theme();
++        let colors = active_theme.colors();
+ 
+         let (base_bg, hover_bg, active_bg) = if selected {
+             (
+diff --git a/crates/gpui/src/app.rs b/crates/gpui/src/app.rs
+index eadba91a..3631499f 100644
+--- a/crates/gpui/src/app.rs
++++ b/crates/gpui/src/app.rs
+@@ -261,7 +261,6 @@ pub(crate) type KeystrokeObserver =
+     Box<dyn FnMut(&KeystrokeEvent, &mut Window, &mut App) -> bool + 'static>;
+ type QuitHandler = Box<dyn FnOnce(&mut App) -> LocalBoxFuture<'static, ()> + 'static>;
+ type WindowClosedHandler = Box<dyn FnMut(&mut App, WindowId)>;
+-type WindowDrawObserver = Box<dyn FnMut(&mut Window, &mut App) + 'static>;
+ type ReleaseListener = Box<dyn FnOnce(&mut dyn Any, &mut App) + 'static>;
+ type NewEntityListener = Box<dyn FnMut(AnyEntity, &mut Option<&mut Window>, &mut App) + 'static>;
+ 
+@@ -645,7 +644,6 @@ pub struct App {
+     pub(crate) quit_observers: SubscriberSet<(), QuitHandler>,
+     pub(crate) restart_observers: SubscriberSet<(), Handler>,
+     pub(crate) window_closed_observers: SubscriberSet<(), WindowClosedHandler>,
+-    pub(crate) window_draw_observers: SubscriberSet<(), WindowDrawObserver>,
+ 
+     /// Per-App element arena. This isolates element allocations between different
+     /// App instances (important for tests where multiple Apps run concurrently).
+@@ -769,7 +767,6 @@ impl App {
+                 restart_observers: SubscriberSet::new(),
+                 restart_path: None,
+                 window_closed_observers: SubscriberSet::new(),
+-                window_draw_observers: SubscriberSet::new(),
+                 layout_id_buffer: Default::default(),
+                 propagate_event: true,
+                 prompt_builder: Some(PromptBuilder::Default),
+@@ -2159,47 +2156,6 @@ impl App {
+         subscription
+     }
+ 
+-    /// Register a callback to be invoked at the start of every window's draw,
+-    /// before its element tree is rendered. The callback receives the window
+-    /// being drawn and the app context, so it can prepare per-window state that
+-    /// the render pass will read (for example, swapping the active theme).
+-    ///
+-    /// The callback runs on every frame of every window, so it must be cheap and
+-    /// must not schedule work that would invalidate the window it just prepared
+-    /// (which would cause an unbounded redraw loop). See
+-    /// [`App::update_global_quietly`] for mutating globals without notifying
+-    /// observers from within such a callback.
+-    pub fn observe_window_draw(
+-        &self,
+-        on_draw: impl FnMut(&mut Window, &mut App) + 'static,
+-    ) -> Subscription {
+-        let (subscription, activate) = self.window_draw_observers.insert((), Box::new(on_draw));
+-        activate();
+-        subscription
+-    }
+-
+-    /// Updates the global of the given type in place without notifying its
+-    /// observers.
+-    ///
+-    /// This is intended for high-frequency, transient updates — such as
+-    /// per-frame state set from an [`App::observe_window_draw`] callback — where
+-    /// the observer notification scheduled by [`update_global`] would cause a
+-    /// redundant re-render every frame (and, for state read during draw, an
+-    /// unbounded redraw loop). Observers will NOT be informed of the change.
+-    ///
+-    /// [`update_global`]: crate::BorrowAppContext::update_global
+-    #[track_caller]
+-    pub fn update_global_quietly<G: Global, R>(
+-        &mut self,
+-        f: impl FnOnce(&mut G, &mut Self) -> R,
+-    ) -> R {
+-        let mut lease = self.lease_global::<G>();
+-        let result = f(&mut lease, self);
+-        self.globals_by_type
+-            .insert(TypeId::of::<G>(), lease.global);
+-        result
+-    }
+-
+     pub(crate) fn clear_pending_keystrokes(&mut self) {
+         for window in self.windows() {
+             window
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+index a7fb5e02..c3a84c0b 100644
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -2602,15 +2602,6 @@ impl Window {
+                 self.rendered_frame.input_handlers.push(Some(input_handler));
+             }
+         }
+-        // Let observers prepare per-window state (e.g. the active theme) before
+-        // the element tree is rendered. Runs every frame, so observers must be
+-        // cheap and must not notify in a way that re-invalidates this window.
+-        let draw_observers = cx.window_draw_observers.clone();
+-        draw_observers.retain(&(), |observer| {
+-            observer(self, cx);
+-            true
+-        });
+-
+         if !cx.mode.skip_drawing() {
+             self.draw_roots(cx);
+         }
+diff --git a/crates/inspector_ui/src/inspector.rs b/crates/inspector_ui/src/inspector.rs
+index 36eed3bc..43cdabb5 100644
+--- a/crates/inspector_ui/src/inspector.rs
++++ b/crates/inspector_ui/src/inspector.rs
+@@ -58,7 +58,8 @@ fn render_inspector(
+     cx: &mut Context<Inspector>,
+ ) -> AnyElement {
+     let ui_font = theme_settings::setup_ui_font(window, cx);
+-    let colors = cx.theme().colors();
++    let active_theme = cx.theme();
++    let colors = active_theme.colors();
+     let inspector_id = inspector.active_element_id();
+     let toolbar_height = platform_title_bar_height(window);
+ 
+diff --git a/crates/keymap_editor/src/keymap_editor.rs b/crates/keymap_editor/src/keymap_editor.rs
+index 6677fe66..d9dca622 100644
+--- a/crates/keymap_editor/src/keymap_editor.rs
++++ b/crates/keymap_editor/src/keymap_editor.rs
+@@ -2394,7 +2394,8 @@ impl SyntaxHighlightedText {
+ impl RenderOnce for SyntaxHighlightedText {
+     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+         let text_style = window.text_style();
+-        let syntax_theme = cx.theme().syntax();
++        let active_theme = cx.theme();
++        let syntax_theme = active_theme.syntax();
+ 
+         let text = self.text.clone();
+ 
+@@ -3049,7 +3050,8 @@ impl Render for KeybindingEditorModal {
+     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+         self.add_action_arguments_input(window, cx);
+ 
+-        let theme = cx.theme().colors();
++        let active_theme = cx.theme();
++        let theme = active_theme.colors();
+         let matching_bindings_count = self.get_matching_bindings_count(cx);
+         let key_context = self.key_context_internal(window, cx);
+         let showing_completions = key_context.contains("showing_completions");
+@@ -3442,7 +3444,8 @@ impl ActionArgumentsEditor {
+ impl Render for ActionArgumentsEditor {
+     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+         let settings = theme_settings::ThemeSettings::get_global(cx);
+-        let colors = cx.theme().colors();
++        let active_theme = cx.theme();
++        let colors = active_theme.colors();
+ 
+         let border_color = if self.is_loading {
+             colors.border_disabled
+diff --git a/crates/keymap_editor/src/ui_components/keystroke_input.rs b/crates/keymap_editor/src/ui_components/keystroke_input.rs
+index 75cc2869..0f381f4c 100644
+--- a/crates/keymap_editor/src/ui_components/keystroke_input.rs
++++ b/crates/keymap_editor/src/ui_components/keystroke_input.rs
+@@ -464,7 +464,8 @@ impl Focusable for KeystrokeInput {
+ 
+ impl Render for KeystrokeInput {
+     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+-        let colors = cx.theme().colors();
++        let active_theme = cx.theme();
++        let colors = active_theme.colors();
+         let is_focused = self.outer_focus_handle.contains_focused(window, cx);
+         let is_recording = self.is_recording(window);
+ 
+diff --git a/crates/language/src/buffer.rs b/crates/language/src/buffer.rs
+index 633436f4..7ce78a3a 100644
+--- a/crates/language/src/buffer.rs
++++ b/crates/language/src/buffer.rs
+@@ -822,7 +822,8 @@ impl EditPreview {
+             background_color: Some(cx.theme().status().deleted_background),
+             ..Default::default()
+         };
+-        let syntax_theme = cx.theme().syntax();
++        let theme = cx.theme();
++        let syntax_theme = theme.syntax();
+ 
+         for (range, edit_text) in edits {
+             let edit_new_end_in_preview_snapshot = range
+diff --git a/crates/language_tools/src/highlights_tree_view.rs b/crates/language_tools/src/highlights_tree_view.rs
+index 1b58e830..332bd154 100644
+--- a/crates/language_tools/src/highlights_tree_view.rs
++++ b/crates/language_tools/src/highlights_tree_view.rs
+@@ -584,7 +584,8 @@ impl HighlightsTreeView {
+     }
+ 
+     fn render_entry(&self, entry: &HighlightEntry, selected: bool, cx: &App) -> Div {
+-        let colors = cx.theme().colors();
++        let active_theme = cx.theme();
++        let colors = active_theme.colors();
+         let style_preview = render_style_preview(entry.style, selected, cx);
+ 
+         h_flex()
+@@ -606,7 +607,8 @@ impl HighlightsTreeView {
+     }
+ 
+     fn render_separator(&self, label: &SharedString, cx: &App) -> Div {
+-        let colors = cx.theme().colors();
++        let active_theme = cx.theme();
++        let colors = active_theme.colors();
+         h_flex()
+             .gap_1()
+             .px(rems(0.5))
+@@ -1279,7 +1281,8 @@ fn format_anchor_range(
+ }
+ 
+ fn render_style_preview(style: HighlightStyle, selected: bool, cx: &App) -> Div {
+-    let colors = cx.theme().colors();
++    let active_theme = cx.theme();
++    let colors = active_theme.colors();
+ 
+     let display_color = style.color.or(style.background_color);
+ 
+diff --git a/crates/language_tools/src/syntax_tree_view.rs b/crates/language_tools/src/syntax_tree_view.rs
+index 9c751dd8..cdec2fb2 100644
+--- a/crates/language_tools/src/syntax_tree_view.rs
++++ b/crates/language_tools/src/syntax_tree_view.rs
+@@ -367,7 +367,8 @@ impl SyntaxTreeView {
+     }
+ 
+     fn render_node(cursor: &TreeCursor, depth: u32, selected: bool, cx: &App) -> Div {
+-        let colors = cx.theme().colors();
++        let active_theme = cx.theme();
++        let colors = active_theme.colors();
+         let mut row = h_flex();
+         if let Some(field_name) = cursor.field_name() {
+             row = row.children([Label::new(field_name).color(Color::Info), Label::new(": ")]);
+diff --git a/crates/markdown/src/markdown.rs b/crates/markdown/src/markdown.rs
+index 99b3fd20..54c9ab81 100644
+--- a/crates/markdown/src/markdown.rs
++++ b/crates/markdown/src/markdown.rs
+@@ -149,8 +149,9 @@ pub enum MarkdownFont {
+ 
+ impl MarkdownStyle {
+     pub fn themed(font: MarkdownFont, window: &Window, cx: &App) -> Self {
+-        let colors = cx.theme().colors();
+-        let syntax = cx.theme().syntax().clone();
++        let theme = cx.theme();
++        let colors = theme.colors();
++        let syntax = theme.syntax().clone();
+         Self::themed_with_overrides(font, colors, &syntax, window, cx)
+     }
+ 
+@@ -210,7 +211,8 @@ impl MarkdownStyle {
+             rule_color: colors.border,
+             block_quote_border_color: colors.border,
+             block_quote_kind_colors: {
+-                let status = cx.theme().status();
++                let theme = cx.theme();
++                let status = theme.status();
+                 BlockQuoteKindColors {
+                     note: status.info,
+                     tip: status.success,
+@@ -360,8 +362,7 @@ impl MarkdownStyle {
+     }
+ 
+     pub fn with_muted_text(mut self, cx: &App) -> Self {
+-        let colors = cx.theme().colors();
+-        self.base_text_style.color = colors.text_muted;
++        self.base_text_style.color = cx.theme().colors().text_muted;
+         self
+     }
+ }
+@@ -1637,7 +1638,8 @@ impl MarkdownElement {
+     ) {
+         let markdown = self.markdown.read(cx);
+         let active_index = markdown.active_search_highlight;
+-        let colors = cx.theme().colors();
++        let theme = cx.theme();
++        let colors = theme.colors();
+ 
+         for (i, highlight_range) in markdown.search_highlights.iter().enumerate() {
+             let color = if Some(i) == active_index {
+diff --git a/crates/markdown/src/mermaid.rs b/crates/markdown/src/mermaid.rs
+index 6ecb3f07..3b40e987 100644
+--- a/crates/markdown/src/mermaid.rs
++++ b/crates/markdown/src/mermaid.rs
+@@ -168,11 +168,12 @@ fn mermaid_font_family(font_family: &str) -> String {
+ }
+ 
+ fn build_mermaid_theme(cx: &Context<Markdown>) -> mermaid_render::MermaidTheme {
+-    let colors = cx.theme().colors();
++    let theme = cx.theme();
++    let colors = theme.colors();
+     let theme_settings = ThemeSettings::get_global(cx);
+-    let is_dark = !cx.theme().appearance.is_light();
++    let is_dark = !theme.appearance.is_light();
+ 
+-    let players = cx.theme().players();
++    let players = theme.players();
+     let git_branch_colors = std::array::from_fn(|i| players.0[i % players.0.len()].cursor);
+     let git_branch_label_colors = git_branch_colors.map(mermaid_render::text_color_for_background);
+ 
+@@ -200,8 +201,8 @@ fn build_mermaid_theme(cx: &Context<Markdown>) -> mermaid_render::MermaidTheme {
+         git_branch_label_colors,
+         er_attr_bg_odd: colors.surface_background,
+         er_attr_bg_even: colors.element_background,
+-        error_color: cx.theme().status().error,
+-        warning_color: cx.theme().status().warning,
++        error_color: theme.status().error,
++        warning_color: theme.status().warning,
+         accent_colors: players
+             .0
+             .iter()
+diff --git a/crates/onboarding/src/basics_page.rs b/crates/onboarding/src/basics_page.rs
+index a4b17a0c..680ebcc8 100644
+--- a/crates/onboarding/src/basics_page.rs
++++ b/crates/onboarding/src/basics_page.rs
+@@ -132,7 +132,8 @@ fn render_theme_section(tab_index: &mut isize, cx: &mut App) -> impl IntoElement
+             let theme = &themes[index];
+             let is_selected = theme.name == current_theme_name;
+             let name = theme.name.clone();
+-            let colors = cx.theme().colors();
++            let active_theme = cx.theme();
++            let colors = active_theme.colors();
+ 
+             v_flex()
+                 .w_full()
+diff --git a/crates/platform_title_bar/src/platforms/platform_linux.rs b/crates/platform_title_bar/src/platforms/platform_linux.rs
+index 8dd6c6f6..98850773 100644
+--- a/crates/platform_title_bar/src/platforms/platform_linux.rs
++++ b/crates/platform_title_bar/src/platforms/platform_linux.rs
+@@ -114,7 +114,8 @@ pub struct WindowControlStyle {
+ 
+ impl WindowControlStyle {
+     pub fn default(cx: &mut App) -> Self {
+-        let colors = cx.theme().colors();
++        let active_theme = cx.theme();
++        let colors = active_theme.colors();
+ 
+         Self {
+             background: colors.ghost_element_background,
+diff --git a/crates/project_panel/src/project_panel.rs b/crates/project_panel/src/project_panel.rs
+index eece41c9..39810854 100644
+--- a/crates/project_panel/src/project_panel.rs
++++ b/crates/project_panel/src/project_panel.rs
+@@ -607,7 +607,8 @@ struct ItemColors {
+ }
+ 
+ fn get_item_color(is_sticky: bool, cx: &App) -> ItemColors {
+-    let colors = cx.theme().colors();
++    let active_theme = cx.theme();
++    let colors = active_theme.colors();
+ 
+     ItemColors {
+         default: if is_sticky {
+diff --git a/crates/search/src/buffer_search.rs b/crates/search/src/buffer_search.rs
+index 5e20f2e7..51af8387 100644
+--- a/crates/search/src/buffer_search.rs
++++ b/crates/search/src/buffer_search.rs
+@@ -332,7 +332,8 @@ impl Render for BufferSearchBar {
+         let should_show_replace_input = self.replace_enabled && replacement;
+         let in_replace = self.replacement_editor.focus_handle(cx).is_focused(window);
+ 
+-        let theme_colors = cx.theme().colors();
++        let active_theme = cx.theme();
++        let theme_colors = active_theme.colors();
+         let query_border = if self.query_error.is_some() {
+             Color::Error.color(cx)
+         } else {
+diff --git a/crates/search/src/project_search.rs b/crates/search/src/project_search.rs
+index e5530717..1ec1684d 100644
+--- a/crates/search/src/project_search.rs
++++ b/crates/search/src/project_search.rs
+@@ -2202,7 +2202,8 @@ impl Render for ProjectSearchBar {
+                 InputPanel::Include | InputPanel::Exclude => div.flex_grow_1(),
+             })
+         };
+-        let theme_colors = cx.theme().colors();
++        let active_theme = cx.theme();
++        let theme_colors = active_theme.colors();
+         let project_search = search.entity.read(cx);
+         let limit_reached = project_search.search_state.limit_reached();
+         let is_search_underway = project_search.pending_search.is_some();
+diff --git a/crates/settings_ui/src/components/input_field.rs b/crates/settings_ui/src/components/input_field.rs
+index e93944cf..6167b481 100644
+--- a/crates/settings_ui/src/components/input_field.rs
++++ b/crates/settings_ui/src/components/input_field.rs
+@@ -214,7 +214,8 @@ impl RenderOnce for SettingsInputField {
+         let clear_on_confirm = self.clear_on_confirm;
+         let clear_on_confirm_for_button = self.clear_on_confirm;
+ 
+-        let theme_colors = cx.theme().colors();
++        let active_theme = cx.theme();
++        let theme_colors = active_theme.colors();
+ 
+         let display_confirm_button = self.display_confirm_button;
+         let display_clear_button = self.display_clear_button;
+diff --git a/crates/settings_ui/src/pages/tool_permissions_setup.rs b/crates/settings_ui/src/pages/tool_permissions_setup.rs
+index 8f010bc6..ad3a41b5 100644
+--- a/crates/settings_ui/src/pages/tool_permissions_setup.rs
++++ b/crates/settings_ui/src/pages/tool_permissions_setup.rs
+@@ -518,7 +518,8 @@ fn render_verification_section(
+         None => (None, true),
+     };
+ 
+-    let color = cx.theme().colors();
++    let active_theme = cx.theme();
++    let color = active_theme.colors();
+ 
+     v_flex()
+         .mt_3()
+@@ -804,7 +805,8 @@ fn render_invalid_patterns_section(
+     cx: &mut Context<SettingsWindow>,
+ ) -> AnyElement {
+     let section_id = format!("{}-invalid-patterns-section", tool_id);
+-    let theme_colors = cx.theme().colors();
++    let active_theme = cx.theme();
++    let theme_colors = active_theme.colors();
+ 
+     v_flex()
+         .id(section_id)
+diff --git a/crates/sidebar/src/sidebar.rs b/crates/sidebar/src/sidebar.rs
+index 6c2f6ea5..7af0ce8e 100644
+--- a/crates/sidebar/src/sidebar.rs
++++ b/crates/sidebar/src/sidebar.rs
+@@ -2298,7 +2298,8 @@ impl Sidebar {
+                 .into_any_element()
+         };
+ 
+-        let color = cx.theme().colors();
++        let active_theme = cx.theme();
++        let color = active_theme.colors();
+         let sidebar_base_bg = color
+             .title_bar_background
+             .blend(color.panel_background.opacity(0.25));
+@@ -3060,7 +3061,8 @@ impl Sidebar {
+             })
+             .unwrap_or(px(0.));
+ 
+-        let color = cx.theme().colors();
++        let active_theme = cx.theme();
++        let color = active_theme.colors();
+         let background = color
+             .title_bar_background
+             .blend(color.panel_background.opacity(0.2));
+@@ -6102,7 +6104,8 @@ impl Sidebar {
+ 
+         let id = SharedString::from(format!("thread-entry-{}", ix));
+ 
+-        let color = cx.theme().colors();
++        let active_theme = cx.theme();
++        let color = active_theme.colors();
+         let sidebar_bg = color
+             .title_bar_background
+             .blend(color.panel_background.opacity(0.25));
+@@ -6444,7 +6447,8 @@ impl Sidebar {
+         let id = ElementId::from(format!("terminal-{}", terminal.metadata.terminal_id));
+         let timestamp = format_history_entry_timestamp(terminal.metadata.created_at);
+         let is_hovered = self.hovered_thread_index == Some(ix);
+-        let color = cx.theme().colors();
++        let active_theme = cx.theme();
++        let color = active_theme.colors();
+         let sidebar_bg = color
+             .title_bar_background
+             .blend(color.panel_background.opacity(0.25));
+@@ -7818,7 +7822,8 @@ impl Render for Sidebar {
+         let ui_font = theme_settings::setup_ui_font(window, cx);
+         let sticky_header = self.render_sticky_header(window, cx);
+ 
+-        let color = cx.theme().colors();
++        let active_theme = cx.theme();
++        let color = active_theme.colors();
+         let bg = color
+             .title_bar_background
+             .blend(color.panel_background.opacity(0.25));
+diff --git a/crates/terminal_view/src/terminal_element.rs b/crates/terminal_view/src/terminal_element.rs
+index cd0ed924..6c476c41 100644
+--- a/crates/terminal_view/src/terminal_element.rs
++++ b/crates/terminal_view/src/terminal_element.rs
+@@ -415,7 +415,7 @@ impl TerminalElement {
+ 
+                 // Collect background regions (skip default background)
+                 if !is_default_background_color(bg) {
+-                    let color = convert_color(&bg, theme);
++                    let color = convert_color(&bg, &theme);
+                     let col = point.column as i32;
+ 
+                     // Try to extend the last region if it's on the same line with the same color
+@@ -453,7 +453,7 @@ impl TerminalElement {
+                             cell,
+                             fg,
+                             bg,
+-                            theme,
++                            &theme,
+                             text_style,
+                             hyperlink,
+                             minimum_contrast,
+diff --git a/crates/terminal_view/src/terminal_view.rs b/crates/terminal_view/src/terminal_view.rs
+index 61646d72..5dfc0601 100644
+--- a/crates/terminal_view/src/terminal_view.rs
++++ b/crates/terminal_view/src/terminal_view.rs
+@@ -1373,7 +1373,8 @@ impl Render for TerminalView {
+                         self.mode.clone(),
+                     ))
+                     .when(self.content_mode(window, cx).is_scrollable(), |div| {
+-                        let colors = cx.theme().colors();
++                        let active_theme = cx.theme();
++                        let colors = active_theme.colors();
+                         div.custom_scrollbars(
+                             Scrollbars::for_settings::<TerminalScrollbarSettingsWrapper>()
+                                 .show_along(ScrollAxes::Vertical)
+diff --git a/crates/theme/src/theme.rs b/crates/theme/src/theme.rs
+index dfcd3796..c4b85b58 100644
+--- a/crates/theme/src/theme.rs
++++ b/crates/theme/src/theme.rs
+@@ -21,12 +21,14 @@ mod theme_settings_provider;
+ mod ui_density;
+ mod window_theme;
+ 
++use std::cell::RefCell;
+ use std::sync::Arc;
+ 
+ use gpui::BorrowAppContext;
+ use gpui::Global;
+ use gpui::{
+-    App, AssetSource, Hsla, Pixels, SharedString, WindowAppearance, WindowBackgroundAppearance, px,
++    App, AssetSource, Hsla, Pixels, SharedString, WindowAppearance, WindowBackgroundAppearance,
++    WindowId, px,
+ };
+ use serde::Deserialize;
+ 
+@@ -116,16 +118,11 @@ pub fn init(themes_to_load: LoadThemes, cx: &mut App) {
+     let icon_theme = themes.default_icon_theme().unwrap();
+     cx.set_global(GlobalTheme::new(theme, icon_theme));
+ 
+-    // Per-window theming: a registry of user-chosen, per-window theme overrides
+-    // and a draw hook that swaps the active theme into place at the start of each
+-    // window's render pass. Windows without an override render the configured
+-    // theme.
++    // Per-window theming: a registry of user-chosen, per-window theme overrides.
++    // `Workspace::render` applies a window's override (or the configured theme)
++    // via `GlobalTheme::set_active_theme_for_window` before anything else in that
++    // window reads `cx.theme()`.
+     cx.set_global(WindowThemeOverrides::default());
+-    cx.observe_window_draw(|window, cx| {
+-        let window_id = window.window_handle().window_id();
+-        WindowThemeOverrides::apply_for_window(cx, window_id);
+-    })
+-    .detach();
+     // Drop a closed window's override so the in-memory map doesn't grow for the
+     // lifetime of the session. The persisted override (keyed by workspace) is
+     // untouched and still restores on reopen.
+@@ -138,11 +135,11 @@ pub fn init(themes_to_load: LoadThemes, cx: &mut App) {
+ /// Implementing this trait allows accessing the active theme.
+ pub trait ActiveTheme {
+     /// Returns the active theme.
+-    fn theme(&self) -> &Arc<Theme>;
++    fn theme(&self) -> Arc<Theme>;
+ }
+ 
+ impl ActiveTheme for App {
+-    fn theme(&self) -> &Arc<Theme> {
++    fn theme(&self) -> Arc<Theme> {
+         GlobalTheme::theme(self)
+     }
+ }
+@@ -311,11 +308,18 @@ pub fn deserialize_icon_theme(bytes: &[u8]) -> anyhow::Result<IconThemeFamilyCon
+ 
+ /// The active theme.
+ pub struct GlobalTheme {
+-    /// The theme used for the render pass currently in progress. The per-window
+-    /// theming hook swaps this at the start of each window's draw via
+-    /// [`GlobalTheme::set_active_theme`]; for windows without an override it
+-    /// equals `configured_theme`.
+-    theme: Arc<Theme>,
++    /// The theme for whichever window is rendering right now. `Workspace::render`
++    /// sets this via [`GlobalTheme::set_active_theme_for_window`] before anything
++    /// else in that window reads [`GlobalTheme::theme`]; for windows without an
++    /// override it equals `configured_theme`.
++    ///
++    /// This is `RefCell`, not a plain field, so setting it (every window render)
++    /// goes through `cx.global()` — an immutable borrow — rather than
++    /// `cx.update_global()`/`global_mut()`, which schedule a `GlobalTheme`
++    /// observer notification on every call. Since this is set on every render,
++    /// that notification would re-invalidate the window that was just rendered
++    /// and cause an unbounded redraw loop.
++    active_theme: RefCell<Arc<Theme>>,
+     /// The app-wide theme configured via settings. Used as the fallback for
+     /// windows that have no per-window override, and never swapped per frame.
+     configured_theme: Arc<Theme>,
+@@ -328,8 +332,8 @@ impl GlobalTheme {
+     /// given theme becomes both the active and the configured theme.
+     pub fn new(theme: Arc<Theme>, icon_theme: Arc<IconTheme>) -> Self {
+         Self {
+-            configured_theme: theme.clone(),
+-            theme,
++            active_theme: RefCell::new(theme.clone()),
++            configured_theme: theme,
+             icon_theme,
+         }
+     }
+@@ -339,16 +343,19 @@ impl GlobalTheme {
+     pub fn update_theme(cx: &mut App, theme: Arc<Theme>) {
+         cx.update_global::<Self, _>(|this, _| {
+             this.configured_theme = theme.clone();
+-            this.theme = theme;
++            *this.active_theme.borrow_mut() = theme;
+         });
+     }
+ 
+-    /// Sets the theme for the render pass currently in progress *without*
+-    /// notifying observers. Used by the per-window theming draw hook every frame;
+-    /// notifying here would re-invalidate the window and cause an unbounded
+-    /// redraw loop. See [`gpui::App::update_global_quietly`].
+-    pub fn set_active_theme(cx: &mut App, theme: Arc<Theme>) {
+-        cx.update_global_quietly::<Self, _>(|this, _| this.theme = theme);
++    /// Sets the active theme for the window currently rendering: its override if
++    /// one is set in `WindowThemeOverrides`, otherwise the configured theme.
++    /// Called once, from `Workspace::render`, before anything in the window reads
++    /// [`GlobalTheme::theme`]. See the `active_theme` field doc for why this
++    /// doesn't go through `update_global`.
++    pub fn set_active_theme_for_window(cx: &App, window_id: WindowId) {
++        let theme = WindowThemeOverrides::theme(cx, window_id)
++            .unwrap_or_else(|| Self::configured_theme(cx).clone());
++        *cx.global::<Self>().active_theme.borrow_mut() = theme;
+     }
+ 
+     /// Updates the active icon theme.
+@@ -356,9 +363,9 @@ impl GlobalTheme {
+         cx.update_global::<Self, _>(|this, _| this.icon_theme = icon_theme);
+     }
+ 
+-    /// Returns the active theme (the theme for the window currently drawing).
+-    pub fn theme(cx: &App) -> &Arc<Theme> {
+-        &cx.global::<Self>().theme
++    /// Returns the active theme (the theme for the window currently rendering).
++    pub fn theme(cx: &App) -> Arc<Theme> {
++        cx.global::<Self>().active_theme.borrow().clone()
+     }
+ 
+     /// Returns the app-wide configured theme — the fallback used for windows
+diff --git a/crates/theme/src/window_theme.rs b/crates/theme/src/window_theme.rs
+index 71b9b549..f4a89c6a 100644
+--- a/crates/theme/src/window_theme.rs
++++ b/crates/theme/src/window_theme.rs
+@@ -3,7 +3,7 @@ use std::sync::Arc;
+ 
+ use gpui::{App, BorrowAppContext, Global, SharedString, WindowId};
+ 
+-use crate::{GlobalTheme, Theme};
++use crate::Theme;
+ 
+ /// A single per-window theme override: the chosen theme's name (kept for
+ /// persistence and re-resolution) plus its resolved value (ready to apply during
+@@ -78,14 +78,4 @@ impl WindowThemeOverrides {
+             })
+             .unwrap_or_default()
+     }
+-
+-    /// Sets the active theme for the window currently being drawn: its override
+-    /// if present, otherwise the app-wide configured theme. Runs every frame from
+-    /// the window-draw hook, so it sets the active theme without notifying
+-    /// observers (see [`GlobalTheme::set_active_theme`]).
+-    pub fn apply_for_window(cx: &mut App, window_id: WindowId) {
+-        let theme =
+-            Self::theme(cx, window_id).unwrap_or_else(|| GlobalTheme::configured_theme(cx).clone());
+-        GlobalTheme::set_active_theme(cx, theme);
+-    }
+ }
+diff --git a/crates/title_bar/src/collab.rs b/crates/title_bar/src/collab.rs
+index ae503e4d..6bd1638e 100644
+--- a/crates/title_bar/src/collab.rs
++++ b/crates/title_bar/src/collab.rs
+@@ -161,7 +161,8 @@ impl TitleBar {
+             .when_some(
+                 current_user.zip(client.peer_id()).zip(room),
+                 |this, ((current_user, peer_id), room)| {
+-                    let player_colors = cx.theme().players();
++                    let active_theme = cx.theme();
++                    let player_colors = active_theme.players();
+                     let room = room.read(cx);
+                     let mut remote_participants =
+                         room.remote_participants().values().collect::<Vec<_>>();
+diff --git a/crates/ui/src/components/ai/thread_item.rs b/crates/ui/src/components/ai/thread_item.rs
+index 6f72405c..eb30c9cd 100644
+--- a/crates/ui/src/components/ai/thread_item.rs
++++ b/crates/ui/src/components/ai/thread_item.rs
+@@ -249,7 +249,8 @@ impl ThreadItem {
+ 
+ impl RenderOnce for ThreadItem {
+     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+-        let color = cx.theme().colors();
++        let theme = cx.theme();
++        let color = theme.colors();
+         let sidebar_base_bg = color
+             .title_bar_background
+             .blend(color.panel_background.opacity(0.25));
+@@ -633,7 +634,8 @@ impl Component for ThreadItem {
+     }
+ 
+     fn preview(_window: &mut Window, cx: &mut App) -> AnyElement {
+-        let color = cx.theme().colors();
++        let theme = cx.theme();
++        let color = theme.colors();
+         let bg = color
+             .title_bar_background
+             .blend(color.panel_background.opacity(0.25));
+diff --git a/crates/ui/src/components/keybinding_hint.rs b/crates/ui/src/components/keybinding_hint.rs
+index 0e74ad07..027b2e59 100644
+--- a/crates/ui/src/components/keybinding_hint.rs
++++ b/crates/ui/src/components/keybinding_hint.rs
+@@ -206,8 +206,9 @@ impl KeybindingHint {
+ 
+ impl RenderOnce for KeybindingHint {
+     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+-        let colors = cx.theme().colors();
+-        let is_light = cx.theme().appearance() == Appearance::Light;
++        let theme = cx.theme();
++        let colors = theme.colors();
++        let is_light = theme.appearance() == Appearance::Light;
+ 
+         let border_color =
+             self.background_color
+diff --git a/crates/ui/src/components/scrollbar.rs b/crates/ui/src/components/scrollbar.rs
+index 3e2c8c8b..9e24ce8c 100644
+--- a/crates/ui/src/components/scrollbar.rs
++++ b/crates/ui/src/components/scrollbar.rs
+@@ -1310,7 +1310,8 @@ impl<T: ScrollableHandle> Element for ScrollbarElement<T> {
+ 
+         let bounds = Bounds::new(self.origin + origin, size);
+         window.with_content_mask(Some(ContentMask { bounds }), |window| {
+-            let colors = cx.theme().colors();
++            let theme = cx.theme();
++            let colors = theme.colors();
+ 
+             let capture_phase;
+ 
+diff --git a/crates/ui/src/components/toggle.rs b/crates/ui/src/components/toggle.rs
+index 85568dbb..2dbbe416 100644
+--- a/crates/ui/src/components/toggle.rs
++++ b/crates/ui/src/components/toggle.rs
+@@ -305,8 +305,9 @@ impl SwitchColor {
+ 
+         match self {
+             SwitchColor::Accent => {
+-                let status = cx.theme().status();
+-                let colors = cx.theme().colors();
++                let theme = cx.theme();
++                let status = theme.status();
++                let colors = theme.colors();
+                 (status.info.opacity(0.4), colors.text_accent.opacity(0.2))
+             }
+             SwitchColor::Custom(color) => (*color, color.opacity(0.6)),
+diff --git a/crates/ui_input/src/input_field.rs b/crates/ui_input/src/input_field.rs
+index b384fd38..5dd26f5f 100644
+--- a/crates/ui_input/src/input_field.rs
++++ b/crates/ui_input/src/input_field.rs
+@@ -139,7 +139,8 @@ impl Render for InputField {
+             self.editor.set_masked(masked, window, cx);
+         }
+ 
+-        let theme_color = cx.theme().colors();
++        let theme = cx.theme();
++        let theme_color = theme.colors();
+ 
+         let style = InputFieldStyle {
+             text_color: theme_color.text,
+diff --git a/crates/workspace/src/welcome.rs b/crates/workspace/src/welcome.rs
+index 122cc468..40dded6c 100644
+--- a/crates/workspace/src/welcome.rs
++++ b/crates/workspace/src/welcome.rs
+@@ -324,7 +324,8 @@ impl WelcomePage {
+ 
+     fn render_agent_card(&self, tab_index: usize, cx: &mut Context<Self>) -> impl IntoElement {
+         let focus = self.focus_handle.clone();
+-        let color = cx.theme().colors();
++        let active_theme = cx.theme();
++        let color = active_theme.colors();
+ 
+         let description = "Run multiple threads at once, mix and match any ACP-compatible agent, and keep work conflict-free with worktrees.";
+ 
+diff --git a/crates/workspace/src/workspace.rs b/crates/workspace/src/workspace.rs
+index 893d9798..a5201e6a 100644
+--- a/crates/workspace/src/workspace.rs
++++ b/crates/workspace/src/workspace.rs
+@@ -8627,6 +8627,10 @@ impl Render for DraggedDock {
+ 
+ impl Render for Workspace {
+     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
++        // Apply this window's theme override (if any) before anything below reads
++        // `cx.theme()`. See `GlobalTheme::set_active_theme_for_window`.
++        theme::GlobalTheme::set_active_theme_for_window(cx, window.window_handle().window_id());
++
+         static FIRST_PAINT: AtomicBool = AtomicBool::new(true);
+         if FIRST_PAINT.swap(false, std::sync::atomic::Ordering::Relaxed) {
+             log::info!("Rendered first frame");
+-- 
+2.54.0
+

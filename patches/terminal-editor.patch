@@ -1,0 +1,1129 @@
+From 5120a14254719fe7dad329e4a9d4cc5f7b743d12 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?A=CC=82nderson=20Q?= <anquadros@gmail.com>
+Date: Sat, 6 Jun 2026 18:54:32 -0300
+Subject: [PATCH 1/8] terminal: add toggleable multi-line input editor
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds a 'toggle: terminal editor' action that opens a 3-row editor docked at the bottom of the terminal for composing input with full editor controls (mouse cursor positioning, selection, multi-row free editing). Enter sends the composed text to the shell; alt-enter inserts a newline; toggling again closes it. Opening is suppressed while a full-screen program (vim, top, ssh, …) owns the terminal.
+
+Addresses the request in discussion #25482 (treat the terminal more like an editor) via a compose-and-send overlay rather than in-shell cursor movement.
+---
+ assets/keymaps/default-macos.json         |   8 ++
+ crates/terminal_view/src/terminal_view.rs | 100 ++++++++++++++++++++++
+ 2 files changed, 108 insertions(+)
+
+diff --git a/assets/keymaps/default-macos.json b/assets/keymaps/default-macos.json
+index a14cc04f..46d244c1 100644
+--- a/assets/keymaps/default-macos.json
++++ b/assets/keymaps/default-macos.json
+@@ -288,6 +288,14 @@
+       "alt-enter": "editor::Newline",
+     },
+   },
++  {
++    "context": "TerminalInputOverlay > Editor",
++    "use_key_equivalents": true,
++    "bindings": {
++      "enter": "menu::Confirm",
++      "alt-enter": "editor::Newline",
++    },
++  },
+   {
+     "context": "AgentConfiguration",
+     "bindings": {
+diff --git a/crates/terminal_view/src/terminal_view.rs b/crates/terminal_view/src/terminal_view.rs
+index 61646d72..25d77654 100644
+--- a/crates/terminal_view/src/terminal_view.rs
++++ b/crates/terminal_view/src/terminal_view.rs
+@@ -104,6 +104,13 @@ actions!(
+ #[action(namespace = terminal)]
+ pub struct RenameTerminal;
+ 
++/// Toggles a multi-line editor for composing terminal input with full editor
++/// controls (mouse positioning, selection, free editing across rows). Toggle
++/// again to close. Disabled while a full-screen program owns the terminal.
++#[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Action)]
++#[action(namespace = toggle)]
++pub struct TerminalEditor;
++
+ pub fn init(cx: &mut App) {
+     terminal_panel::init(cx);
+ 
+@@ -152,6 +159,7 @@ pub struct TerminalView {
+     self_handle: WeakEntity<Self>,
+     rename_editor: Option<Entity<Editor>>,
+     rename_editor_subscription: Option<Subscription>,
++    input_overlay: Option<Entity<Editor>>,
+     _subscriptions: Vec<Subscription>,
+     _terminal_subscriptions: Vec<Subscription>,
+ }
+@@ -298,6 +306,7 @@ impl TerminalView {
+             self_handle: cx.entity().downgrade(),
+             rename_editor: None,
+             rename_editor_subscription: None,
++            input_overlay: None,
+             _subscriptions: subscriptions,
+             _terminal_subscriptions: terminal_subscriptions,
+         }
+@@ -493,6 +502,73 @@ impl TerminalView {
+         cx.emit(Event::Wakeup);
+     }
+ 
++    pub fn input_overlay_is_open(&self) -> bool {
++        self.input_overlay.is_some()
++    }
++
++    /// Toggle the terminal-editor overlay. Opening is suppressed while a
++    /// full-screen program (vim, top, less, an ssh session, …) owns the
++    /// terminal, since there is no shell prompt to send the line to. Toggle
++    /// again to close.
++    fn toggle_input_overlay(
++        &mut self,
++        _: &TerminalEditor,
++        window: &mut Window,
++        cx: &mut Context<Self>,
++    ) {
++        if self.input_overlay.is_some() {
++            self.close_input_overlay(window, cx);
++            return;
++        }
++
++        if self
++            .terminal
++            .read(cx)
++            .last_content
++            .mode
++            .contains(Modes::ALT_SCREEN)
++        {
++            return;
++        }
++
++        let editor = cx.new(|cx| Editor::auto_height(3, 3, window, cx));
++        editor.update(cx, |editor, cx| {
++            editor.focus_handle(cx).focus(window, cx);
++        });
++
++        self.input_overlay = Some(editor);
++        cx.notify();
++    }
++
++    fn submit_input_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
++        let Some(editor) = self.input_overlay.clone() else {
++            return;
++        };
++
++        let text = editor.read(cx).text(cx);
++        // Carriage return is what a terminal sends for Return; this submits the
++        // composed text to the shell exactly as typing it and pressing enter.
++        let mut bytes = text.into_bytes();
++        bytes.push(b'\r');
++        self.terminal.update(cx, |term, _| term.input(bytes));
++
++        // Keep the overlay open as a persistent composer: clear it and keep
++        // focus so the next command can be typed without reopening.
++        editor.update(cx, |editor, cx| {
++            editor.clear(window, cx);
++            editor.focus_handle(cx).focus(window, cx);
++        });
++        cx.notify();
++    }
++
++    fn close_input_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
++        if self.input_overlay.take().is_none() {
++            return;
++        }
++        self.focus_handle.focus(window, cx);
++        cx.notify();
++    }
++
+     pub fn deploy_context_menu(
+         &mut self,
+         position: GpuiPoint<Pixels>,
+@@ -1332,6 +1408,7 @@ impl Render for TerminalView {
+             .on_action(cx.listener(TerminalView::select_all))
+             .on_action(cx.listener(TerminalView::rerun_task))
+             .on_action(cx.listener(TerminalView::rename_terminal))
++            .on_action(cx.listener(TerminalView::toggle_input_overlay))
+             .on_key_down(cx.listener(Self::key_down))
+             .on_mouse_down(
+                 MouseButton::Right,
+@@ -1396,6 +1473,29 @@ impl Render for TerminalView {
+                 )
+                 .with_priority(1)
+             }))
++            .when_some(self.input_overlay.clone(), |this, editor| {
++                let colors = cx.theme().colors();
++                let submit_handle = self.self_handle.clone();
++                this.child(
++                    div()
++                        .key_context("TerminalInputOverlay")
++                        .absolute()
++                        .bottom_0()
++                        .left_0()
++                        .right_0()
++                        .px_3()
++                        .py_2()
++                        .bg(colors.elevated_surface_background)
++                        .border_t_1()
++                        .border_color(colors.border)
++                        .child(editor)
++                        .on_action(move |_: &menu::Confirm, window, cx| {
++                            submit_handle
++                                .update(cx, |this, cx| this.submit_input_overlay(window, cx))
++                                .ok();
++                        }),
++                )
++            })
+     }
+ }
+ 
+-- 
+2.54.0
+
+
+From 9ca2dd4ee52e7740a3fe06fc3a221f96474c9099 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?A=CC=82nderson=20Q?= <anquadros@gmail.com>
+Date: Sat, 6 Jun 2026 19:23:07 -0300
+Subject: [PATCH 2/8] terminal: refine terminal editor (idiomatic action,
+ cross-platform keys, newline handling)
+
+- Move the action to the terminal namespace as terminal::Editor (was a toggle namespace), matching Zed's feature-namespaced action convention.
+- Add the enter/alt-enter bindings to the Linux and Windows keymaps (were macOS-only).
+- Normalize line breaks to carriage returns on submit, mirroring Terminal::paste, so multi-row composes replay as if typed.
+- Remove an unused helper.
+---
+ assets/keymaps/default-linux.json         |  7 ++++++
+ assets/keymaps/default-windows.json       |  8 +++++++
+ crates/terminal_view/src/terminal_view.rs | 26 +++++++++++++----------
+ 3 files changed, 30 insertions(+), 11 deletions(-)
+
+diff --git a/assets/keymaps/default-linux.json b/assets/keymaps/default-linux.json
+index 29988d2c..a96bdfd0 100644
+--- a/assets/keymaps/default-linux.json
++++ b/assets/keymaps/default-linux.json
+@@ -248,6 +248,13 @@
+       "alt-enter": "editor::Newline",
+     },
+   },
++  {
++    "context": "TerminalInputOverlay > Editor",
++    "bindings": {
++      "enter": "menu::Confirm",
++      "alt-enter": "editor::Newline",
++    },
++  },
+   {
+     "context": "AcpThread > ModeSelector",
+     "bindings": {
+diff --git a/assets/keymaps/default-windows.json b/assets/keymaps/default-windows.json
+index 3d926a67..5040151c 100644
+--- a/assets/keymaps/default-windows.json
++++ b/assets/keymaps/default-windows.json
+@@ -249,6 +249,14 @@
+       "alt-enter": "editor::Newline",
+     },
+   },
++  {
++    "context": "TerminalInputOverlay > Editor",
++    "use_key_equivalents": true,
++    "bindings": {
++      "enter": "menu::Confirm",
++      "alt-enter": "editor::Newline",
++    },
++  },
+   {
+     "context": "AcpThread > ModeSelector",
+     "bindings": {
+diff --git a/crates/terminal_view/src/terminal_view.rs b/crates/terminal_view/src/terminal_view.rs
+index 25d77654..89a80945 100644
+--- a/crates/terminal_view/src/terminal_view.rs
++++ b/crates/terminal_view/src/terminal_view.rs
+@@ -108,7 +108,7 @@ pub struct RenameTerminal;
+ /// controls (mouse positioning, selection, free editing across rows). Toggle
+ /// again to close. Disabled while a full-screen program owns the terminal.
+ #[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Action)]
+-#[action(namespace = toggle)]
++#[action(namespace = terminal, name = "Editor")]
+ pub struct TerminalEditor;
+ 
+ pub fn init(cx: &mut App) {
+@@ -502,10 +502,6 @@ impl TerminalView {
+         cx.emit(Event::Wakeup);
+     }
+ 
+-    pub fn input_overlay_is_open(&self) -> bool {
+-        self.input_overlay.is_some()
+-    }
+-
+     /// Toggle the terminal-editor overlay. Opening is suppressed while a
+     /// full-screen program (vim, top, less, an ssh session, …) owns the
+     /// terminal, since there is no shell prompt to send the line to. Toggle
+@@ -545,12 +541,20 @@ impl TerminalView {
+             return;
+         };
+ 
+-        let text = editor.read(cx).text(cx);
+-        // Carriage return is what a terminal sends for Return; this submits the
+-        // composed text to the shell exactly as typing it and pressing enter.
+-        let mut bytes = text.into_bytes();
+-        bytes.push(b'\r');
+-        self.terminal.update(cx, |term, _| term.input(bytes));
++        // Replay the composed text as if typed: every line break becomes a
++        // carriage return (what a terminal sends for Return), matching
++        // `Terminal::paste` normalization, with a trailing return to submit the
++        // final line.
++        let mut input = editor
++            .read(cx)
++            .text(cx)
++            .replace("\r\n", "\r")
++            .replace('\n', "\r");
++        if !input.ends_with('\r') {
++            input.push('\r');
++        }
++        self.terminal
++            .update(cx, |term, _| term.input(input.into_bytes()));
+ 
+         // Keep the overlay open as a persistent composer: clear it and keep
+         // focus so the next command can be typed without reopening.
+-- 
+2.54.0
+
+
+From 0ef86eb9bfad6ee3038630f0e96e182c654310c7 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?A=CC=82nderson=20Q?= <anquadros@gmail.com>
+Date: Sun, 7 Jun 2026 10:59:51 -0300
+Subject: [PATCH 3/8] terminal: test the input editor overlay
+
+Extract the line-break normalization into a pure helper and cover it,
+plus toggle open/close, submit (newlines to carriage returns, persistent
+composer), and suppression while a full-screen program owns the terminal.
+---
+ crates/terminal_view/src/terminal_view.rs | 147 ++++++++++++++++++++--
+ 1 file changed, 135 insertions(+), 12 deletions(-)
+
+diff --git a/crates/terminal_view/src/terminal_view.rs b/crates/terminal_view/src/terminal_view.rs
+index 89a80945..59b19820 100644
+--- a/crates/terminal_view/src/terminal_view.rs
++++ b/crates/terminal_view/src/terminal_view.rs
+@@ -111,6 +111,18 @@ pub struct RenameTerminal;
+ #[action(namespace = terminal, name = "Editor")]
+ pub struct TerminalEditor;
+ 
++/// Turns text composed in the input overlay into the bytes a shell expects from
++/// a typed-and-submitted command: every line break becomes a carriage return
++/// (what a terminal sends for Return, matching `Terminal::paste` normalization),
++/// with a trailing return so the final line is submitted.
++fn compose_terminal_submission(text: &str) -> String {
++    let mut input = text.replace("\r\n", "\r").replace('\n', "\r");
++    if !input.ends_with('\r') {
++        input.push('\r');
++    }
++    input
++}
++
+ pub fn init(cx: &mut App) {
+     terminal_panel::init(cx);
+ 
+@@ -541,18 +553,7 @@ impl TerminalView {
+             return;
+         };
+ 
+-        // Replay the composed text as if typed: every line break becomes a
+-        // carriage return (what a terminal sends for Return), matching
+-        // `Terminal::paste` normalization, with a trailing return to submit the
+-        // final line.
+-        let mut input = editor
+-            .read(cx)
+-            .text(cx)
+-            .replace("\r\n", "\r")
+-            .replace('\n', "\r");
+-        if !input.ends_with('\r') {
+-            input.push('\r');
+-        }
++        let input = compose_terminal_submission(&editor.read(cx).text(cx));
+         self.terminal
+             .update(cx, |term, _| term.input(input.into_bytes()));
+ 
+@@ -2388,6 +2389,128 @@ mod tests {
+         );
+     }
+ 
++    #[gpui::test]
++    fn test_compose_terminal_submission(_cx: &mut TestAppContext) {
++        // A single line gets a trailing return so it is submitted.
++        assert_eq!(compose_terminal_submission("echo hi"), "echo hi\r");
++        // An already-terminated line is not double-terminated.
++        assert_eq!(compose_terminal_submission("echo hi\n"), "echo hi\r");
++        // Interior newlines (and CRLF) become carriage returns, so each line is
++        // run in turn, matching what typing the lines would send.
++        assert_eq!(compose_terminal_submission("a\nb\nc"), "a\rb\rc\r");
++        assert_eq!(compose_terminal_submission("a\r\nb"), "a\rb\r");
++        // Empty input still submits (sends a bare return, like pressing Enter).
++        assert_eq!(compose_terminal_submission(""), "\r");
++    }
++
++    #[gpui::test]
++    async fn terminal_editor_overlay_toggles_open_and_closed(cx: &mut TestAppContext) {
++        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
++        let (_pane, _terminal, terminal_view) =
++            add_display_only_terminal(&project, window_handle, true, cx);
++
++        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
++        cx.update(|window, cx| {
++            let _ = window.draw(cx);
++        });
++        cx.run_until_parked();
++
++        cx.update(|window, cx| {
++            terminal_view.update(cx, |view, cx| {
++                assert!(view.input_overlay.is_none());
++                view.toggle_input_overlay(&TerminalEditor, window, cx);
++                assert!(view.input_overlay.is_some(), "first toggle opens the overlay");
++                view.toggle_input_overlay(&TerminalEditor, window, cx);
++                assert!(
++                    view.input_overlay.is_none(),
++                    "second toggle closes the overlay"
++                );
++            });
++        });
++    }
++
++    #[gpui::test]
++    async fn terminal_editor_overlay_submits_normalized_input(cx: &mut TestAppContext) {
++        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
++        let (_pane, terminal, terminal_view) =
++            add_display_only_terminal(&project, window_handle, true, cx);
++
++        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
++        cx.update(|window, cx| {
++            let _ = window.draw(cx);
++        });
++        cx.run_until_parked();
++
++        // Open the overlay and compose a multi-line command.
++        cx.update(|window, cx| {
++            terminal_view.update(cx, |view, cx| {
++                view.toggle_input_overlay(&TerminalEditor, window, cx);
++                let editor = view
++                    .input_overlay
++                    .clone()
++                    .expect("overlay should be open after toggle");
++                editor.update(cx, |editor, cx| {
++                    editor.set_text("echo hi\nls", window, cx);
++                });
++            });
++        });
++
++        // Submitting replays the composed text to the shell: each newline becomes
++        // a carriage return, with a trailing return to run the final line.
++        terminal.update(&mut cx, |terminal, _| terminal.take_input_log());
++        cx.update(|window, cx| {
++            terminal_view.update(cx, |view, cx| {
++                view.submit_input_overlay(window, cx);
++            });
++        });
++        assert_eq!(
++            terminal.update(&mut cx, |terminal, _| terminal.take_input_log()),
++            vec![b"echo hi\rls\r".to_vec()],
++        );
++
++        // The overlay stays open as a persistent composer and is cleared for the
++        // next command.
++        terminal_view.read_with(&cx, |view, cx| {
++            let editor = view
++                .input_overlay
++                .clone()
++                .expect("overlay should remain open after submit");
++            assert_eq!(editor.read(cx).text(cx), "");
++        });
++    }
++
++    #[gpui::test]
++    async fn terminal_editor_overlay_suppressed_in_alt_screen(cx: &mut TestAppContext) {
++        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
++        let (_pane, terminal, terminal_view) =
++            add_display_only_terminal(&project, window_handle, true, cx);
++
++        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
++        cx.update(|window, cx| {
++            let _ = window.draw(cx);
++        });
++        cx.run_until_parked();
++
++        // A full-screen program takes over the terminal (alternate screen).
++        cx.update(|window, cx| {
++            terminal.update(cx, |terminal, cx| {
++                terminal.write_output(ENTER_ALT_SCREEN, cx);
++                terminal.sync(window, cx);
++            });
++        });
++        terminal.read_with(&cx, |terminal, _| {
++            assert!(terminal.last_content.mode.contains(Modes::ALT_SCREEN));
++        });
++
++        // Toggling does nothing: there is no shell prompt to send a line to.
++        cx.update(|window, cx| {
++            terminal_view.update(cx, |view, cx| {
++                view.toggle_input_overlay(&TerminalEditor, window, cx);
++                assert!(view.input_overlay.is_none());
++            });
++        });
++    }
++
+     // Working directory calculation tests
+ 
+     // No Worktrees in project -> home_dir()
+-- 
+2.54.0
+
+
+From 6f398a8b60eedb1485241b245c6145f5c49553a5 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?A=CC=82nderson=20Q?= <anquadros@gmail.com>
+Date: Sun, 7 Jun 2026 11:26:37 -0300
+Subject: [PATCH 4/8] terminal: bind cmd-alt-e to toggle the input editor
+ overlay
+
+The action toggles, so one chord opens and closes it. Bound in both the
+Terminal context and the overlay's own editor context (ctrl-alt-e on
+Linux/Windows), with a keystroke test covering the round trip.
+---
+ assets/keymaps/default-linux.json         |  2 ++
+ assets/keymaps/default-macos.json         |  2 ++
+ assets/keymaps/default-windows.json       |  2 ++
+ crates/terminal_view/src/terminal_view.rs | 38 +++++++++++++++++++++++
+ 4 files changed, 44 insertions(+)
+
+diff --git a/assets/keymaps/default-linux.json b/assets/keymaps/default-linux.json
+index a96bdfd0..367603e9 100644
+--- a/assets/keymaps/default-linux.json
++++ b/assets/keymaps/default-linux.json
+@@ -253,6 +253,7 @@
+     "bindings": {
+       "enter": "menu::Confirm",
+       "alt-enter": "editor::Newline",
++      "ctrl-alt-e": "terminal::Editor",
+     },
+   },
+   {
+@@ -1246,6 +1247,7 @@
+       "shift-home": "terminal::ScrollToTop",
+       "shift-end": "terminal::ScrollToBottom",
+       "ctrl-shift-space": "terminal::ToggleViMode",
++      "ctrl-alt-e": "terminal::Editor",
+       "ctrl-shift-r": "terminal::RerunTask",
+       "ctrl-alt-r": "terminal::RerunTask",
+       "alt-t": "terminal::RerunTask",
+diff --git a/assets/keymaps/default-macos.json b/assets/keymaps/default-macos.json
+index 46d244c1..61e5b486 100644
+--- a/assets/keymaps/default-macos.json
++++ b/assets/keymaps/default-macos.json
+@@ -294,6 +294,7 @@
+     "bindings": {
+       "enter": "menu::Confirm",
+       "alt-enter": "editor::Newline",
++      "cmd-alt-e": "terminal::Editor",
+     },
+   },
+   {
+@@ -1318,6 +1319,7 @@
+       "ctrl-alt-left": "pane::SplitLeft",
+       "ctrl-alt-right": "pane::SplitRight",
+       "cmd-d": "pane::SplitRight",
++      "cmd-alt-e": "terminal::Editor",
+       "cmd-alt-r": "terminal::RerunTask",
+       "cmd->": "agent::AddSelectionToThread",
+     },
+diff --git a/assets/keymaps/default-windows.json b/assets/keymaps/default-windows.json
+index 5040151c..b241626a 100644
+--- a/assets/keymaps/default-windows.json
++++ b/assets/keymaps/default-windows.json
+@@ -255,6 +255,7 @@
+     "bindings": {
+       "enter": "menu::Confirm",
+       "alt-enter": "editor::Newline",
++      "ctrl-alt-e": "terminal::Editor",
+     },
+   },
+   {
+@@ -1261,6 +1262,7 @@
+       "shift-home": "terminal::ScrollToTop",
+       "shift-end": "terminal::ScrollToBottom",
+       "ctrl-shift-space": "terminal::ToggleViMode",
++      "ctrl-alt-e": "terminal::Editor",
+       "ctrl-shift-r": "terminal::RerunTask",
+       "ctrl-alt-r": "terminal::RerunTask",
+       "alt-t": "terminal::RerunTask",
+diff --git a/crates/terminal_view/src/terminal_view.rs b/crates/terminal_view/src/terminal_view.rs
+index 59b19820..745a4386 100644
+--- a/crates/terminal_view/src/terminal_view.rs
++++ b/crates/terminal_view/src/terminal_view.rs
+@@ -2511,6 +2511,44 @@ mod tests {
+         });
+     }
+ 
++    #[gpui::test]
++    async fn terminal_editor_overlay_keybinding_toggles(cx: &mut TestAppContext) {
++        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
++        cx.update(load_default_keymap);
++        let (_pane, _terminal, terminal_view) =
++            add_display_only_terminal(&project, window_handle, true, cx);
++
++        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
++        cx.update(|window, cx| {
++            let _ = window.draw(cx);
++        });
++        cx.run_until_parked();
++
++        // cmd-alt-e, bound in the `Terminal` context, opens the overlay.
++        cx.simulate_keystrokes("cmd-alt-e");
++        cx.update(|window, cx| {
++            let _ = window.draw(cx);
++        });
++        cx.run_until_parked();
++        terminal_view.read_with(&cx, |view, _| {
++            assert!(
++                view.input_overlay.is_some(),
++                "cmd-alt-e should open the overlay"
++            )
++        });
++
++        // The same chord, bound in the `TerminalInputOverlay > Editor` context,
++        // closes it from within — a single toggle, not two commands.
++        cx.simulate_keystrokes("cmd-alt-e");
++        cx.run_until_parked();
++        terminal_view.read_with(&cx, |view, _| {
++            assert!(
++                view.input_overlay.is_none(),
++                "cmd-alt-e should close the overlay from inside it"
++            )
++        });
++    }
++
+     // Working directory calculation tests
+ 
+     // No Worktrees in project -> home_dir()
+-- 
+2.54.0
+
+
+From c7244b0633a8557f4910b07e216bb32561830a37 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?A=CC=82nderson=20Q?= <anquadros@gmail.com>
+Date: Sun, 7 Jun 2026 11:33:59 -0300
+Subject: [PATCH 5/8] terminal: keep terminal content above the input editor
+ overlay
+
+The overlay was absolutely positioned, so the terminal's bottom rows
+rendered underneath it. Lay the view out as a column where the terminal
+takes the remaining space and the overlay reserves its own height, so the
+grid reflows above it. Covered by a viewport-shrink regression test.
+---
+ crates/terminal_view/src/terminal_view.rs | 53 ++++++++++++++++++++---
+ 1 file changed, 48 insertions(+), 5 deletions(-)
+
+diff --git a/crates/terminal_view/src/terminal_view.rs b/crates/terminal_view/src/terminal_view.rs
+index 745a4386..4a7e8abf 100644
+--- a/crates/terminal_view/src/terminal_view.rs
++++ b/crates/terminal_view/src/terminal_view.rs
+@@ -1392,6 +1392,8 @@ impl Render for TerminalView {
+             .id("terminal-view")
+             .size_full()
+             .relative()
++            .flex()
++            .flex_col()
+             .track_focus(&self.focus_handle(cx))
+             .key_context(self.dispatch_context(cx))
+             .on_action(cx.listener(TerminalView::send_text))
+@@ -1442,7 +1444,12 @@ impl Render for TerminalView {
+                 // TODO: Oddly this wrapper div is needed for TerminalElement to not steal events from the context menu
+                 div()
+                     .id("terminal-view-container")
+-                    .size_full()
++                    // Take the space left above the input overlay (when open) so
++                    // the terminal grid reflows to fewer rows instead of letting
++                    // its bottom lines render underneath the overlay.
++                    .flex_1()
++                    .overflow_hidden()
++                    .w_full()
+                     .bg(cx.theme().colors().editor_background)
+                     .child(TerminalElement::new(
+                         terminal_handle,
+@@ -1484,10 +1491,11 @@ impl Render for TerminalView {
+                 this.child(
+                     div()
+                         .key_context("TerminalInputOverlay")
+-                        .absolute()
+-                        .bottom_0()
+-                        .left_0()
+-                        .right_0()
++                        // A normal flow child at the bottom of the column (not
++                        // absolutely positioned), so it reserves its own height
++                        // and the terminal above shrinks to fit.
++                        .flex_shrink_0()
++                        .w_full()
+                         .px_3()
+                         .py_2()
+                         .bg(colors.elevated_surface_background)
+@@ -2549,6 +2557,41 @@ mod tests {
+         });
+     }
+ 
++    #[gpui::test]
++    async fn terminal_editor_overlay_shrinks_terminal_viewport(cx: &mut TestAppContext) {
++        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
++        let (_pane, terminal, terminal_view) =
++            add_display_only_terminal(&project, window_handle, true, cx);
++
++        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
++        cx.simulate_resize(gpui::size(gpui::px(800.), gpui::px(600.)));
++        cx.update(|window, cx| {
++            let _ = window.draw(cx);
++        });
++        cx.run_until_parked();
++        let rows_without_overlay = terminal.read_with(&cx, |terminal, _| terminal.viewport_lines());
++        assert!(rows_without_overlay > 0, "terminal should have visible rows");
++
++        // Open the overlay and redraw.
++        cx.update(|window, cx| {
++            terminal_view.update(cx, |view, cx| {
++                view.toggle_input_overlay(&TerminalEditor, window, cx);
++            });
++            let _ = window.draw(cx);
++        });
++        cx.run_until_parked();
++        let rows_with_overlay = terminal.read_with(&cx, |terminal, _| terminal.viewport_lines());
++
++        // The overlay reserves its own height at the bottom of the column, so the
++        // terminal grid reflows to fewer visible rows instead of letting its
++        // bottom lines render underneath the overlay.
++        assert!(
++            rows_with_overlay < rows_without_overlay,
++            "terminal viewport should shrink when the overlay opens: \
++             without={rows_without_overlay} with={rows_with_overlay}",
++        );
++    }
++
+     // Working directory calculation tests
+ 
+     // No Worktrees in project -> home_dir()
+-- 
+2.54.0
+
+
+From f76994d60d24ca14cca49d03bbbd453a18b59edf Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?A=CC=82nderson=20Q?= <anquadros@gmail.com>
+Date: Tue, 9 Jun 2026 07:46:18 -0300
+Subject: [PATCH 6/8] terminal: Render the input composer in the terminal's
+ font
+
+The multi-line input composer rendered in the editor's default buffer
+style, so its font, size and line spacing did not match the terminal it
+feeds. Apply the terminal's resolved text style (family, fallbacks,
+features, weight, size, and the font-size-relative line height) to the
+composer editor so a typed command looks exactly as it will in the
+terminal above it.
+---
+ crates/terminal_view/src/terminal_view.rs | 81 ++++++++++++++++++++++-
+ 1 file changed, 78 insertions(+), 3 deletions(-)
+
+diff --git a/crates/terminal_view/src/terminal_view.rs b/crates/terminal_view/src/terminal_view.rs
+index 4a7e8abf..d1c00337 100644
+--- a/crates/terminal_view/src/terminal_view.rs
++++ b/crates/terminal_view/src/terminal_view.rs
+@@ -10,9 +10,10 @@ use editor::{
+ };
+ use gpui::{
+     Action, AnyElement, App, ClipboardEntry, DismissEvent, Entity, EventEmitter, ExternalPaths,
+-    FocusHandle, Focusable, Font, KeyContext, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent,
+-    Pixels, Point as GpuiPoint, Render, ScrollWheelEvent, Styled, Subscription, Task, TaskExt,
+-    WeakEntity, actions, anchored, deferred, div,
++    FocusHandle, Focusable, Font, FontFeatures, FontStyle, KeyContext, KeyDownEvent, Keystroke,
++    MouseButton, MouseDownEvent, Pixels, Point as GpuiPoint, Render, ScrollWheelEvent, Styled,
++    Subscription, Task, TaskExt, TextStyleRefinement, WeakEntity, actions, anchored, deferred, div,
++    relative,
+ };
+ use menu;
+ use persistence::TerminalDb;
+@@ -42,6 +43,7 @@ use terminal_element::TerminalElement;
+ use terminal_panel::TerminalPanel;
+ use terminal_path_like_target::{hover_path_like_target, open_path_like_target};
+ use terminal_scrollbar::TerminalScrollHandle;
++use theme_settings::ThemeSettings;
+ use ui::{
+     ContextMenu, Divider, ScrollAxes, Scrollbars, Tooltip, WithScrollbar,
+     prelude::*,
+@@ -123,6 +125,49 @@ fn compose_terminal_submission(text: &str) -> String {
+     input
+ }
+ 
++/// The terminal's text style as an editor text-style refinement, so the input
++/// composer renders exactly like the terminal it feeds — same font family,
++/// size, weight, features and line height — rather than the editor's default
++/// buffer style. Mirrors the resolution in [`TerminalElement`].
++fn terminal_input_text_style(cx: &App) -> TextStyleRefinement {
++    let settings = ThemeSettings::get_global(cx);
++    let terminal_settings = TerminalSettings::get_global(cx);
++
++    let font_family = terminal_settings.font_family.as_ref().map_or_else(
++        || settings.buffer_font.family.clone(),
++        |font_family| font_family.0.clone().into(),
++    );
++    let font_fallbacks = terminal_settings
++        .font_fallbacks
++        .as_ref()
++        .or(settings.buffer_font.fallbacks.as_ref())
++        .cloned();
++    let font_features = terminal_settings
++        .font_features
++        .as_ref()
++        .unwrap_or(&FontFeatures::disable_ligatures())
++        .clone();
++    let font_weight = terminal_settings.font_weight.unwrap_or_default();
++    let font_size = terminal_settings
++        .font_size
++        .map_or(settings.buffer_font_size(cx), |size| {
++            theme_settings::adjusted_font_size(size, cx)
++        });
++
++    TextStyleRefinement {
++        font_family: Some(font_family),
++        font_features: Some(font_features),
++        font_fallbacks,
++        font_weight: Some(font_weight),
++        font_style: Some(FontStyle::Normal),
++        font_size: Some(font_size.into()),
++        // The terminal grid lays out lines at `font_size * line_height`, so use
++        // the same multiplier (relative to the font size) here.
++        line_height: Some(relative(terminal_settings.line_height.value())),
++        ..Default::default()
++    }
++}
++
+ pub fn init(cx: &mut App) {
+     terminal_panel::init(cx);
+ 
+@@ -541,6 +586,9 @@ impl TerminalView {
+ 
+         let editor = cx.new(|cx| Editor::auto_height(3, 3, window, cx));
+         editor.update(cx, |editor, cx| {
++            // Render the composer in the terminal's own text style so a typed
++            // command looks exactly as it will in the terminal above it.
++            editor.set_text_style_refinement(terminal_input_text_style(cx));
+             editor.focus_handle(cx).focus(window, cx);
+         });
+ 
+@@ -2437,6 +2485,33 @@ mod tests {
+         });
+     }
+ 
++    #[gpui::test]
++    async fn terminal_input_style_matches_terminal_font(cx: &mut TestAppContext) {
++        use settings::{FontFamilyName, TerminalLineHeight};
++
++        let (_project, _workspace, _window) = init_test_with_window(cx).await;
++
++        // Configure a distinct terminal font and line height.
++        cx.update_global::<SettingsStore, _>(|store, cx| {
++            store.update_user_settings(cx, |settings| {
++                let terminal = settings.terminal.get_or_insert_default();
++                terminal.font_family = Some(FontFamilyName("Courier New".into()));
++                terminal.line_height = Some(TerminalLineHeight::Custom(2.0));
++            });
++        });
++
++        cx.update(|cx| {
++            let style = terminal_input_text_style(cx);
++            // The composer renders in the configured terminal font (proving it
++            // uses the terminal style, not the application UI font).
++            assert_eq!(style.font_family, Some("Courier New".into()));
++            // Line height follows the configured terminal multiplier, relative to
++            // the font size, matching how the terminal grid lays out lines.
++            assert_eq!(style.line_height, Some(relative(2.0)));
++            assert!(style.font_size.is_some());
++        });
++    }
++
+     #[gpui::test]
+     async fn terminal_editor_overlay_submits_normalized_input(cx: &mut TestAppContext) {
+         let (project, _workspace, window_handle) = init_test_with_window(cx).await;
+-- 
+2.54.0
+
+
+From 2f727b1f501414db02971017f96a0a78d92ddd25 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?A=CC=82nderson=20Q?= <anquadros@gmail.com>
+Date: Sun, 21 Jun 2026 12:52:54 -0300
+Subject: [PATCH 7/8] terminal: Give the input composer a framed, growing
+ layout
+
+Refine the look of the terminal input composer so it reads as a distinct
+box, echoing the spacing a shell prompt leaves below its input.
+
+- Grow from a minimum of 5 rows up to 18, then scroll internally rather
+  than squeezing the terminal grid down to nothing. Because the composer
+  is a normal flow child, growing it pushes the terminal up instead of
+  overlaying it.
+- Frame the editable area with full-width rules top and bottom, and
+  reserve two blank terminal rows beneath a separating rule as padding.
+- Size that padding to whole terminal rows by sharing the composer's
+  font-size resolution between its text style and its line height, so the
+  two never drift apart.
+---
+ crates/terminal_view/src/terminal_view.rs | 72 ++++++++++++++++++++---
+ 1 file changed, 63 insertions(+), 9 deletions(-)
+
+diff --git a/crates/terminal_view/src/terminal_view.rs b/crates/terminal_view/src/terminal_view.rs
+index d1c00337..974a04c6 100644
+--- a/crates/terminal_view/src/terminal_view.rs
++++ b/crates/terminal_view/src/terminal_view.rs
+@@ -106,6 +106,18 @@ actions!(
+ #[action(namespace = terminal)]
+ pub struct RenameTerminal;
+ 
++/// Minimum visible rows of the input composer. The editor is top-aligned, so a
++/// short command leaves the remaining rows blank — a deliberate padding strip
++/// below the text, echoing the breathing room a shell prompt leaves for hints.
++const MIN_INPUT_COMPOSER_LINES: usize = 5;
++/// Maximum rows the composer grows to before it scrolls internally instead of
++/// pushing the terminal further. Keeps a long paste from squeezing the terminal
++/// grid down to nothing; past this the composer scrolls within its own height.
++const MAX_INPUT_COMPOSER_LINES: usize = 18;
++/// Blank terminal rows reserved below the editable area, separated from it by a
++/// rule — the breathing room a shell prompt leaves for hints.
++const INPUT_COMPOSER_PADDING_ROWS: f32 = 2.;
++
+ /// Toggles a multi-line editor for composing terminal input with full editor
+ /// controls (mouse positioning, selection, free editing across rows). Toggle
+ /// again to close. Disabled while a full-screen program owns the terminal.
+@@ -125,6 +137,27 @@ fn compose_terminal_submission(text: &str) -> String {
+     input
+ }
+ 
++/// The composer's font size, resolved exactly like the terminal it feeds: the
++/// terminal's own font size if set, otherwise the buffer font size. Shared by
++/// the composer's text style and its line-height-based padding so the two never
++/// drift apart.
++fn terminal_input_font_size(cx: &App) -> Pixels {
++    let settings = ThemeSettings::get_global(cx);
++    let terminal_settings = TerminalSettings::get_global(cx);
++    terminal_settings
++        .font_size
++        .map_or(settings.buffer_font_size(cx), |size| {
++            theme_settings::adjusted_font_size(size, cx)
++        })
++}
++
++/// The composer's line height in pixels — `font_size * line_height` multiplier,
++/// matching how the terminal grid lays out rows — so spacing expressed in rows
++/// (the padding below the editor) lands on whole terminal lines.
++fn terminal_input_line_height(cx: &App) -> Pixels {
++    terminal_input_font_size(cx) * TerminalSettings::get_global(cx).line_height.value()
++}
++
+ /// The terminal's text style as an editor text-style refinement, so the input
+ /// composer renders exactly like the terminal it feeds — same font family,
+ /// size, weight, features and line height — rather than the editor's default
+@@ -148,11 +181,7 @@ fn terminal_input_text_style(cx: &App) -> TextStyleRefinement {
+         .unwrap_or(&FontFeatures::disable_ligatures())
+         .clone();
+     let font_weight = terminal_settings.font_weight.unwrap_or_default();
+-    let font_size = terminal_settings
+-        .font_size
+-        .map_or(settings.buffer_font_size(cx), |size| {
+-            theme_settings::adjusted_font_size(size, cx)
+-        });
++    let font_size = terminal_input_font_size(cx);
+ 
+     TextStyleRefinement {
+         font_family: Some(font_family),
+@@ -584,7 +613,14 @@ impl TerminalView {
+             return;
+         }
+ 
+-        let editor = cx.new(|cx| Editor::auto_height(3, 3, window, cx));
++        let editor = cx.new(|cx| {
++            Editor::auto_height(
++                MIN_INPUT_COMPOSER_LINES,
++                MAX_INPUT_COMPOSER_LINES,
++                window,
++                cx,
++            )
++        });
+         editor.update(cx, |editor, cx| {
+             // Render the composer in the terminal's own text style so a typed
+             // command looks exactly as it will in the terminal above it.
+@@ -1536,6 +1572,10 @@ impl Render for TerminalView {
+             .when_some(self.input_overlay.clone(), |this, editor| {
+                 let colors = cx.theme().colors();
+                 let submit_handle = self.self_handle.clone();
++                // Express the padding below the editor in whole terminal rows so
++                // it reads as blank prompt lines rather than an arbitrary gap.
++                let padding_height =
++                    terminal_input_line_height(cx) * INPUT_COMPOSER_PADDING_ROWS;
+                 this.child(
+                     div()
+                         .key_context("TerminalInputOverlay")
+@@ -1544,12 +1584,26 @@ impl Render for TerminalView {
+                         // and the terminal above shrinks to fit.
+                         .flex_shrink_0()
+                         .w_full()
+-                        .px_3()
+-                        .py_2()
+                         .bg(colors.elevated_surface_background)
+                         .border_t_1()
++                        .border_b_1()
+                         .border_color(colors.border)
+-                        .child(editor)
++                        .child(
++                            // The editable area, closed off by a full-width line
++                            // that separates it from the blank padding below.
++                            div()
++                                .w_full()
++                                .px_3()
++                                .py_2()
++                                .border_b_1()
++                                .border_color(colors.border)
++                                .child(editor),
++                        )
++                        .child(
++                            // Blank terminal rows beneath the separator, matching
++                            // the regular terminal's prompt spacing.
++                            div().w_full().h(padding_height),
++                        )
+                         .on_action(move |_: &menu::Confirm, window, cx| {
+                             submit_handle
+                                 .update(cx, |this, cx| this.submit_input_overlay(window, cx))
+-- 
+2.54.0
+
+
+From 2733cb1b7b8aae79a65f02a44a911bc0b4ca7bdb Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?A=CC=82nderson=20Q?= <anquadros@gmail.com>
+Date: Sun, 21 Jun 2026 14:49:38 -0300
+Subject: [PATCH 8/8] terminal: Hide a host program's own input chrome behind
+ the composer
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When the input composer is open, a full-screen TUI keeps drawing its own
+input box and status line pinned to the bottom of the grid, duplicating the
+composer. Grow the PTY by a fixed strip of rows beyond the visible area and
+let the terminal's `overflow_hidden` clip them: the program keeps drawing
+that chrome off-screen behind the composer while output stays at the top,
+untouched. The strip is positional, so it holds while scrolling.
+
+Submitting also folds a trailing carriage return into the same write as the
+text, which such a program treats as a newline in its own box rather than a
+submit — forcing a second manual Return. Follow the text with a lone
+carriage return on the next tick so it lands as a discrete Enter keystroke
+and the command runs from a single Return in the composer.
+
+Release Notes:
+
+- Improved the terminal input editor: a host TUI's redundant input box is
+  hidden behind the composer, and a single Return submits the command.
+---
+ crates/terminal_view/src/terminal_element.rs | 11 ++++++
+ crates/terminal_view/src/terminal_view.rs    | 41 +++++++++++++++++++-
+ 2 files changed, 51 insertions(+), 1 deletion(-)
+
+diff --git a/crates/terminal_view/src/terminal_element.rs b/crates/terminal_view/src/terminal_element.rs
+index cd0ed924..e226911a 100644
+--- a/crates/terminal_view/src/terminal_element.rs
++++ b/crates/terminal_view/src/terminal_element.rs
+@@ -1059,6 +1059,17 @@ impl Element for TerminalElement {
+                         }
+                     }
+ 
++                    // While the input composer is open, grow the PTY past the
++                    // visible area by a fixed strip and let the parent's
++                    // `overflow_hidden` clip it. A bottom-pinned TUI keeps drawing
++                    // its own input box + status line into those extra rows, now
++                    // off-screen behind the composer, so its chrome doesn't
++                    // duplicate ours. Output stays at the top, untouched.
++                    if self.terminal_view.read(cx).input_overlay.is_some() {
++                        size.height +=
++                            px(crate::INPUT_COMPOSER_TERMINAL_MASK_ROWS as f32 * line_height);
++                    }
++
+                     // Snap to device pixels to avoid subpixel jitter while resizing.
+                     // Terminal rendering is grid-based; allowing fractional origins can cause the
+                     // glyph rasterization to shift between frames, which looks like flicker.
+diff --git a/crates/terminal_view/src/terminal_view.rs b/crates/terminal_view/src/terminal_view.rs
+index 974a04c6..ef1c71cb 100644
+--- a/crates/terminal_view/src/terminal_view.rs
++++ b/crates/terminal_view/src/terminal_view.rs
+@@ -117,6 +117,14 @@ const MAX_INPUT_COMPOSER_LINES: usize = 18;
+ /// Blank terminal rows reserved below the editable area, separated from it by a
+ /// rule — the breathing room a shell prompt leaves for hints.
+ const INPUT_COMPOSER_PADDING_ROWS: f32 = 2.;
++/// While the composer is open, a full-screen TUI keeps drawing its own input
++/// box and status line pinned to the bottom rows of the grid — redundant with
++/// our composer. We grow the PTY by this many rows beyond the visible area and
++/// clip them, so the program keeps drawing that chrome off-screen behind the
++/// composer. Sized to comfortably cover a typical single-line input box plus a
++/// status line or two; the program never grows its input past this because
++/// typing happens in the composer, not its box.
++const INPUT_COMPOSER_TERMINAL_MASK_ROWS: usize = 6;
+ 
+ /// Toggles a multi-line editor for composing terminal input with full editor
+ /// controls (mouse positioning, selection, free editing across rows). Toggle
+@@ -641,6 +649,24 @@ impl TerminalView {
+         self.terminal
+             .update(cx, |term, _| term.input(input.into_bytes()));
+ 
++        // A bottom-pinned TUI treats the trailing carriage return above as a
++        // newline inside its own input box rather than a submit, because it
++        // arrives folded into the same write as the text. Follow up with a lone
++        // carriage return on the next tick so it lands as a discrete Enter
++        // keystroke and the program runs the command — sparing the user a second
++        // manual Return. (A plain shell already ran on the first return; this just
++        // lands on a fresh prompt.)
++        let terminal = self.terminal.downgrade();
++        cx.spawn(async move |_, cx| {
++            cx.background_executor()
++                .timer(Duration::from_millis(10))
++                .await;
++            terminal
++                .update(cx, |term, _| term.input(b"\r".to_vec()))
++                .ok();
++        })
++        .detach();
++
+         // Keep the overlay open as a persistent composer: clear it and keep
+         // focus so the next command can be typed without reopening.
+         editor.update(cx, |editor, cx| {
+@@ -2605,6 +2631,16 @@ mod tests {
+             vec![b"echo hi\rls\r".to_vec()],
+         );
+ 
++        // A discrete carriage return follows on the next tick, so a bottom-pinned
++        // program that folded the trailing return into its input box still
++        // submits without a second manual Return.
++        cx.executor().advance_clock(Duration::from_millis(20));
++        cx.run_until_parked();
++        assert_eq!(
++            terminal.update(&mut cx, |terminal, _| terminal.take_input_log()),
++            vec![b"\r".to_vec()],
++        );
++
+         // The overlay stays open as a persistent composer and is cleared for the
+         // next command.
+         terminal_view.read_with(&cx, |view, cx| {
+@@ -2713,7 +2749,10 @@ mod tests {
+ 
+         // The overlay reserves its own height at the bottom of the column, so the
+         // terminal grid reflows to fewer visible rows instead of letting its
+-        // bottom lines render underneath the overlay.
++        // bottom lines render underneath the overlay. (The reported row count
++        // still includes the `INPUT_COMPOSER_TERMINAL_MASK_ROWS` strip the
++        // composer hides, yet the composer reserves enough height that the net
++        // visible viewport is smaller than the un-overlaid grid.)
+         assert!(
+             rows_with_overlay < rows_without_overlay,
+             "terminal viewport should shrink when the overlay opens: \
+-- 
+2.54.0
+
